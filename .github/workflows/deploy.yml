@@ -101,7 +101,13 @@ jobs:
             # 清理旧镜像
             docker image prune -af --filter "until=168h"
 
+            # 如果 Nginx 已安装则重载配置（首次部署外通常无需改动）
+            if command -v nginx &> /dev/null && [ -f /etc/nginx/default.d/metar.conf ]; then
+              nginx -t && systemctl reload nginx || true
+            fi
+
             # 健康检查
             sleep 5
             docker compose ps
             docker compose logs --tail=20 web
+            curl -fsS "http://127.0.0.1:8000/health" && echo "Health check passed"

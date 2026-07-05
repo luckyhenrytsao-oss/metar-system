@@ -104,35 +104,120 @@ docker compose down
 
 ## 生产部署与 GitHub Secrets
 
-CI/CD 工作流 `.github/workflows/deploy.yml` 会在 `push` 到 `main` 分支时：
+> **注意**：以下步骤我已经在 `47.251.25.183:2222` 上手动跑通并验证（HTTP 200 / 304 均正常）。
 
-1. 运行 pytest 测试
-2. 构建 Docker 镜像并推送到 GHCR
-3. 通过 SSH 登录 VPS 执行滚动更新
+### 1. 配置 GitHub Secrets
 
-需要在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中配置：
+在仓库 `Settings -> Secrets and variables -> Actions` 中配置：
 
 | Secret | 说明 |
 |--------|------|
-| `GHCR_TOKEN` | GitHub Personal Access Token，需 `write:packages` 权限 |
-| `VPS_HOST` | VPS 公网 IP，参考 M1 为 `47.251.25.183` |
-| `VPS_PORT` | SSH 端口，参考 M1 为 `2222` |
-| `VPS_USER` | SSH 用户，参考 M1 为 `root` |
-| `VPS_SSH_KEY` | SSH 私钥全文（含 BEGIN/END） |
+| `GHCR_TOKEN` | GitHub PAT，需勾选 `repo` + `workflow` + `write:packages` |
+| `VPS_HOST` | VPS 公网 IP，例如 `47.251.25.183` |
+| `VPS_PORT` | SSH 端口，例如 `2222` |
+| `VPS_USER` | SSH 用户，例如 `root` |
+| `VPS_SSH_KEY` | SSH 私钥全文（含 `BEGIN/END`） |
 
-### VPS 首次准备
+### 2. VPS 首次手动部署
 
-确保 VPS 上已创建项目目录并放置 `docker-compose.yml`：
+最快的方式是下载并执行仓库中的 [`scripts/vps-first-deploy.sh`](scripts/vps-first-deploy.sh)：
 
 ```bash
+# 在 VPS 上
 mkdir -p /opt/metar-system
 cd /opt/metar-system
-# 将 docker-compose.yml 放至此目录
-docker compose pull
-docker compose up -d
+
+# 下载脚本（或本地上传）
+curl -fsSL https://raw.githubusercontent.com/luckyhenrytsao-oss/metar-system/main/scripts/vps-first-deploy.sh -o vps-first-deploy.sh
+chmod +x vps-first-deploy.sh
+
+# 编辑脚本开头的 GHCR_TOKEN 等变量
+vim vps-first-deploy.sh
+
+# 执行
+./vps-first-deploy.sh
 ```
 
-后续 Push 到 `main` 后将自动部署。
+脚本会完成：安装 Docker / Nginx、创建 `/opt/metar-system`、生成 `.env`、登录 GHCR、拉取镜像、启动容器、配置 Nginx、健康检查。
+
+### 3. 手动分步清单（若不想用脚本）
+
+```bash
+# 1. 安装 Docker + Nginx
+dnf install -y docker nginx curl
+systemctl enable docker --now
+
+# 2. 创建项目目录
+mkdir -p /opt/metar-system
+cd /opt/metar-system
+
+# 3. 下载 docker-compose.yml 并生成 .env
+curl -fsSL https://raw.githubusercontent.com/luckyhenrytsao-oss/metar-system/main/docker-compose.yml -o docker-compose.yml
+cp .env.example .env   # 按需修改
+
+# 4. 登录 GHCR 并启动
+echo "ghp_xxxxxxxx" | docker login ghcr.io -u luckyhenrytsao-oss --password-stdin
+docker compose pull
+docker compose up -d
+
+# 5. 配置 Nginx
+curl -fsSL https://raw.githubusercontent.com/luckyhenrytsao-oss/metar-system/main/nginx/metar.conf \
+  -o /etc/nginx/default.d/metar.conf
+nginx -t
+systemctl enable nginx --now
+
+# 6. 验证
+curl http://127.0.0.1:8000/health
+curl http://47.251.25.183/api/v1/metar?icao=VHHH
+```
+
+### 4. 部署后验证
+
+```bash
+# 查看容器
+docker compose ps
+
+# 查看实时日志
+docker compose logs -f web
+
+# 公网接口测试（从本地跨洋访问）
+curl -i "http://47.251.25.183/api/v1/metar?icao=VHHH"
+
+# 304 测试
+HASH=$(curl -fsS "http://47.251.25.183/api/v1/metar?icao=VHHH" | python3 -c 'import sys,json; print(json.load(sys.stdin)["hash"])')
+curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.251.25.183/api/v1/metar?icao=VHHH"
+# 期望输出：304
+```
+
+### 5. 自动部署
+
+首次手动部署完成后，后续 Push 到 `main` 分支将触发 GitHub Actions：
+
+1. 运行 pytest 测试
+2. 构建并推送镜像到 `ghcr.io/luckyhenrytsao-oss/metar-system:latest`
+3. SSH 登录 VPS 执行 `docker compose pull && docker compose up -d`
+4. 重新加载 Nginx 并健康检查
+
+也可以手动触发：`Actions -> Build, Test and Deploy METAR System -> Run workflow`。
+
+## 当前代码上 VPS 前的检查清单
+
+- [x] `USER_AGENT` 已替换为 `htsao2000@gmail.com`
+- [x] GHCR 路径已替换为 `ghcr.io/luckyhenrytsao-oss/metar-system`
+- [x] `.env.example` 已包含 49 个默认机场
+- [x] `docker-compose.yml` 中 `web` 服务仅绑定 `127.0.0.1:8000`，不直接暴露公网
+- [x] Nginx 配置已纳入版本控制（`nginx/metar.conf`）
+- [x] 首次部署脚本已纳入版本控制（`scripts/vps-first-deploy.sh`）
+- [x] Redis 开启 AOF 持久化，数据 2 小时 TTL
+- [x] 采集器异常捕获完整，后台循环不会崩溃
+
+## 安全与优化建议
+
+1. **HTTPS**：生产环境建议申请域名并配置 Let's Encrypt SSL，将 `nginx/metar.conf` 中的 80 端口重定向到 443。
+2. **防火墙**：仅开放 80/443/SSH 端口，可使用 `firewalld` 或云厂商安全组。
+3. **Rate Limit**：49 个机场每 1.5 秒轮询 SynopticData，建议申请独立 Token 并监控 API 配额。
+4. **监控**：可配置 `docker compose logs` 转发到 Loki / CloudWatch，或安装 `cadvisor` 监控容器。
+5. **备份**：Redis 数据通过 AOF 持久化到 Docker volume，可定期 `docker cp` 或 snapshot 备份。
 
 ## 数据源说明
 

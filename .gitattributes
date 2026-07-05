@@ -1,0 +1,21 @@
+# 强制 shell 脚本和 Linux 配置文件使用 LF 换行，避免在 Windows 上被 autocrlf 破坏
+*.sh text eol=lf
+*.conf text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.env.example text eol=lf
+.env text eol=lf
+Dockerfile text eol=lf
+
+# Python 与 Markdown 保持默认文本处理
+*.py text
+*.md text
+*.txt text
+
+# 二进制文件不要自动换行
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
