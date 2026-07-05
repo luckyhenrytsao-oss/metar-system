@@ -108,7 +108,7 @@ class TestBatchMetarEndpoint:
             },
             {
                 "icao": "EGLL",
-                "raw_text": "METAR EGLL 050455Z 24008KT 10SM FEW250 M03/M07 A3012",
+                "raw_text": "METAR EGLL 050455Z 24008KT 10SM FEW250 13/10 A3012 RMK AO2 T01330100",
                 "observed_at": "2026-07-05T04:55:00+00:00",
                 "updated_at": "2026-07-05T04:55:00+00:00",
                 "hash": "def789abc012",
@@ -135,8 +135,8 @@ class TestBatchMetarEndpoint:
         assert kjfk["dewpoint_c"] == 18.0
 
         egll = next(item for item in result["data"] if item["icao"] == "EGLL")
-        assert egll["temperature_c"] == -3.0
-        assert egll["dewpoint_c"] == -7.0
+        assert egll["temperature_c"] == 13.3
+        assert egll["dewpoint_c"] == 10.0
 
     def test_batch_ignores_unmonitored_and_no_data(self, test_client, fake_redis):
         """未监控和无数据的机场进入 missing 列表."""

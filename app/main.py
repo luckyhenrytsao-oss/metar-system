@@ -122,11 +122,29 @@ import re
 def parse_temperature(raw_text: str) -> tuple[Optional[float], Optional[float]]:
     """从 METAR raw_text 解析温度与露点（摄氏度）.
 
-    返回 (temperature_c, dewpoint_c)。负数用 M 前缀表示，例如 M05 = -5。
-    解析失败返回 (None, None)。
+    解析优先级：
+      1. RMK 中的 T 组精确温度（T01330100），按符号+4位解析，除以 10
+      2. METAR 主体中的 TT/DD（25/18），负数用 M 前缀
+
+    返回 (temperature_c, dewpoint_c)；解析失败返回 (None, None)。
     """
     if not raw_text:
         return None, None
+
+    # 1. 优先解析 RMK 中的精确 T 组：T 后跟 8 位数字（气温4位+露点4位）
+    #    每位第一位是符号位：1 表示负，0 表示正
+    rmk_match = re.search(r"\bT(0|1)(\d{3})(0|1)(\d{3})\b", raw_text)
+    if rmk_match:
+        temp_sign = -1 if rmk_match.group(1) == "1" else 1
+        temp_val = int(rmk_match.group(2))
+        dew_sign = -1 if rmk_match.group(3) == "1" else 1
+        dew_val = int(rmk_match.group(4))
+        return (
+            temp_sign * temp_val / 10.0,
+            dew_sign * dew_val / 10.0,
+        )
+
+    # 2. 退回到 METAR 主体中的 TT/DD
     match = re.search(r"\s([M]?\d{2})/([M]?\d{2})\s", raw_text)
     if not match:
         return None, None
