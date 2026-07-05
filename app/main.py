@@ -6,8 +6,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 from app.collector import close_http_client, start_collector_loop
 from app.config import Settings, get_settings
@@ -115,3 +116,78 @@ async def health_check():
 
 # 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
 import asyncio  # noqa: E402
+import re
+
+
+def parse_temperature(raw_text: str) -> tuple[Optional[float], Optional[float]]:
+    """从 METAR raw_text 解析温度与露点（摄氏度）.
+
+    返回 (temperature_c, dewpoint_c)。负数用 M 前缀表示，例如 M05 = -5。
+    解析失败返回 (None, None)。
+    """
+    if not raw_text:
+        return None, None
+    match = re.search(r"\s([M]?\d{2})/([M]?\d{2})\s", raw_text)
+    if not match:
+        return None, None
+
+    def _to_celsius(value: str) -> float:
+        if value.startswith("M"):
+            return -float(value[1:])
+        return float(value)
+
+    return _to_celsius(match.group(1)), _to_celsius(match.group(2))
+
+
+class BatchMetarRequest(BaseModel):
+    """批量请求体."""
+
+    icaos: list[str]
+
+
+@app.post("/api/v1/metar/batch")
+async def get_metar_batch(
+    request: BatchMetarRequest,
+    settings: Settings = Depends(get_settings),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """批量获取多个机场的 METAR 与温度信息.
+
+    - 只返回 Redis 中已存在且能解析出温度的机场
+    - `missing` 字段列出无数据或温度解析失败的机场
+    """
+    monitored = {code.upper() for code in settings.monitor_airports_list}
+    data: list[dict[str, Any]] = []
+    missing: list[str] = []
+
+    for icao in request.icaos:
+        code = icao.upper()
+        if code not in monitored:
+            missing.append(code)
+            continue
+
+        metar = await get_metar(redis_client, code)
+        if metar is None:
+            missing.append(code)
+            continue
+
+        temp, dewpoint = parse_temperature(metar.get("raw_text", ""))
+        if temp is None:
+            missing.append(code)
+            continue
+
+        data.append({
+            "icao": code,
+            "temperature_c": temp,
+            "dewpoint_c": dewpoint,
+            "raw_text": metar["raw_text"],
+            "observed_at": metar.get("observed_at"),
+            "updated_at": metar.get("updated_at"),
+            "source": metar.get("source"),
+        })
+
+    return JSONResponse(content={
+        "data": data,
+        "missing": missing,
+        "count": len(data),
+    })

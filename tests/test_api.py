@@ -92,6 +92,75 @@ class TestMetarEndpoint:
         assert response.json()["icao"] == "KJFK"
 
 
+class TestBatchMetarEndpoint:
+    """测试 POST /api/v1/metar/batch 接口."""
+
+    def test_batch_returns_temperatures(self, test_client, fake_redis):
+        """批量请求返回可解析温度的机场."""
+        payloads = [
+            {
+                "icao": "KJFK",
+                "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+                "observed_at": "2026-07-05T04:55:00+00:00",
+                "updated_at": "2026-07-05T04:55:00+00:00",
+                "hash": "abc123def456",
+                "source": "aviationweather.gov",
+            },
+            {
+                "icao": "EGLL",
+                "raw_text": "METAR EGLL 050455Z 24008KT 10SM FEW250 M03/M07 A3012",
+                "observed_at": "2026-07-05T04:55:00+00:00",
+                "updated_at": "2026-07-05T04:55:00+00:00",
+                "hash": "def789abc012",
+                "source": "weather.gov",
+            },
+        ]
+        import asyncio
+
+        for payload in payloads:
+            asyncio.run(set_metar(fake_redis, payload["icao"], payload, 7200))
+
+        response = test_client.post(
+            "/api/v1/metar/batch",
+            json={"icaos": ["KJFK", "EGLL", "ZZZZ"]},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["count"] == 2
+        assert set(item["icao"] for item in result["data"]) == {"KJFK", "EGLL"}
+        assert "ZZZZ" in result["missing"]
+
+        kjfk = next(item for item in result["data"] if item["icao"] == "KJFK")
+        assert kjfk["temperature_c"] == 25.0
+        assert kjfk["dewpoint_c"] == 18.0
+
+        egll = next(item for item in result["data"] if item["icao"] == "EGLL")
+        assert egll["temperature_c"] == -3.0
+        assert egll["dewpoint_c"] == -7.0
+
+    def test_batch_ignores_unmonitored_and_no_data(self, test_client, fake_redis):
+        """未监控和无数据的机场进入 missing 列表."""
+        import asyncio
+
+        asyncio.run(set_metar(fake_redis, "KJFK", {
+            "icao": "KJFK",
+            "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+            "observed_at": "2026-07-05T04:55:00+00:00",
+            "updated_at": "2026-07-05T04:55:00+00:00",
+            "hash": "abc123def456",
+            "source": "aviationweather.gov",
+        }, 7200))
+
+        response = test_client.post(
+            "/api/v1/metar/batch",
+            json={"icaos": ["KJFK", "NODATA"]},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["count"] == 1
+        assert result["missing"] == ["NODATA"]
+
+
 class TestHealthEndpoint:
     """测试健康检查接口."""
 
