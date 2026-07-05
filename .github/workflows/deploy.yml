@@ -37,7 +37,7 @@ jobs:
     name: Build and Push Docker Image
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       packages: write
@@ -78,6 +78,7 @@ jobs:
     name: Deploy to VPS
     needs: build-and-push
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
