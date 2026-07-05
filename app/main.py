@@ -1,0 +1,117 @@
+"""FastAPI 入口：挂载路由与后台异步采集任务."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Any, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse, Response
+
+from app.collector import close_http_client, start_collector_loop
+from app.config import Settings, get_settings
+from app.database import close_redis, get_metar, get_redis
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# 后台采集任务引用
+_collector_task: Optional[asyncio.Task] = None  # type: ignore[name-defined]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理：启动采集器，关闭连接."""
+    global _collector_task
+    settings = get_settings()
+    logging.getLogger().setLevel(getattr(logging, settings.log_level, logging.INFO))
+
+    # 预热 Redis 连接
+    await get_redis(settings)
+
+    # 启动后台采集循环
+    _collector_task = asyncio.create_task(start_collector_loop(settings))
+    logger.info("FastAPI startup complete, collector loop started")
+
+    yield
+
+    # 关闭阶段
+    if _collector_task and not _collector_task.done():
+        _collector_task.cancel()
+        try:
+            await _collector_task
+        except asyncio.CancelledError:
+            pass
+
+    await close_http_client()
+    await close_redis()
+    logger.info("FastAPI shutdown complete")
+
+
+app = FastAPI(
+    title="METAR High-Speed Distribution System",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+async def _get_redis_dependency():
+    """FastAPI 依赖：注入 Redis 连接."""
+    return await get_redis()
+
+
+@app.get("/api/v1/metar")
+async def get_metar_endpoint(
+    icao: str = Query(..., min_length=3, max_length=4, description="ICAO 机场代码"),
+    if_none_match: Optional[str] = Header(None, alias="If-None-Match"),
+    settings: Settings = Depends(get_settings),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """获取指定机场的 METAR 数据.
+
+    - 若 ICAO 不在监控列表，返回 404
+    - 若 Redis 中无数据，返回 404
+    - 若 If-None-Match 与当前 hash 一致，返回 304（空 Body）
+    - 否则返回 JSON，并带上 ETag 头
+    """
+    icao = icao.upper()
+
+    # 校验机场是否在监控列表
+    if icao not in {code.upper() for code in settings.monitor_airports_list}:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ICAO code {icao} is not in the monitored airport list",
+        )
+
+    data = await get_metar(redis_client, icao)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No METAR data available for {icao} yet",
+        )
+
+    current_hash = data.get("hash", "")
+
+    # HTTP 304 优化：客户端已有最新数据，直接返回空 Body
+    if if_none_match and if_none_match.strip('"') == current_hash:
+        return Response(status_code=304)
+
+    return JSONResponse(
+        content=data,
+        headers={"ETag": f'"{current_hash}"'},
+    )
+
+
+@app.get("/health")
+async def health_check():
+    """健康检查接口."""
+    return {"status": "ok"}
+
+
+# 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
+import asyncio  # noqa: E402
