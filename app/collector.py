@@ -163,7 +163,9 @@ def _extract_weathergov_metars(
         if not times or not metars:
             continue
 
-        # 从后往前扫描，取最新一条真正 METAR 且含 RMK+T 精确温度组
+        # 从后往前扫描，取最新一条真正 METAR/SPECI；
+        # 优先选择含 RMK+T 精确温度组的，没有则保留普通 METAR/SPECI。
+        fallback_idx: Optional[int] = None
         for idx in range(len(times) - 1, -1, -1):
             if idx >= len(metars) or not metars[idx]:
                 continue
@@ -172,20 +174,34 @@ def _extract_weathergov_metars(
                 continue
 
             raw_metar = str(metars[idx]).strip()
-            if not raw_metar or not _has_precision_temp(raw_metar):
+            if not raw_metar:
                 continue
 
-            obs_time = _parse_iso_time(times[idx]) or _parse_metar_time(raw_metar, _now_utc())
-            if obs_time is None:
-                continue
+            if _has_precision_temp(raw_metar):
+                # 找到带精确温度组的，立即采用
+                selected_idx = idx
+                break
 
-            results[code] = {
-                "icao": code,
-                "raw_text": raw_metar,
-                "observed_at": obs_time.isoformat(),
-                "source": "weather.gov",
-            }
-            break
+            if fallback_idx is None:
+                fallback_idx = idx
+        else:
+            # for 循环没有 break，使用 fallback
+            selected_idx = fallback_idx
+
+        if selected_idx is None:
+            continue
+
+        raw_metar = str(metars[selected_idx]).strip()
+        obs_time = _parse_iso_time(times[selected_idx]) or _parse_metar_time(raw_metar, _now_utc())
+        if obs_time is None:
+            continue
+
+        results[code] = {
+            "icao": code,
+            "raw_text": raw_metar,
+            "observed_at": obs_time.isoformat(),
+            "source": "weather.gov",
+        }
 
     return results
 
@@ -261,7 +277,8 @@ async def _fetch_awc_single(
 ) -> Optional[dict[str, Any]]:
     """从 AviationWeather.gov 获取单个机场的 METAR.
 
-    只接收含 RMK + T 精确温度组的 METAR/SPECI 报文；AUTO 报直接跳过。
+    只接收 METAR/SPECI 报文；AUTO 报直接跳过。
+    优先选择含 RMK+T 精确温度组的报文，没有则保留普通 METAR/SPECI。
     """
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
@@ -286,20 +303,26 @@ async def _fetch_awc_single(
         if not items:
             return None
 
-        # 优先选择含 RMK+T 精确温度组的 METAR/SPECI；没有则跳过
-        selected = None
+        # 优先选择含 RMK+T 精确温度组的 METAR/SPECI；
+        # 没有精确组时，保留普通 METAR/SPECI；AUTO 报跳过。
+        selected: Optional[dict[str, Any]] = None
+        fallback: Optional[dict[str, Any]] = None
         for item in items:
             raw_metar = item.get("rawOb")
             if not raw_metar:
                 continue
             metar_type = item.get("metarType", "")
-            # 只接受 METAR 或 SPECI，且必须含 RMK + T 组
-            if metar_type in {"METAR", "SPECI"} and _has_precision_temp(raw_metar):
+            if metar_type not in {"METAR", "SPECI"}:
+                continue
+            if _has_precision_temp(raw_metar):
                 selected = item
                 break
+            if fallback is None:
+                fallback = item
 
+        selected = selected or fallback
         if selected is None:
-            logger.debug("AviationWeather has no RMK+T METAR/SPECI for %s, skipping", code)
+            logger.debug("AviationWeather has no METAR/SPECI for %s, skipping", code)
             return None
 
         raw_metar = selected["rawOb"]
