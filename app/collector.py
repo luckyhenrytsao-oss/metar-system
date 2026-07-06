@@ -163,7 +163,7 @@ def _extract_weathergov_metars(
         if not times or not metars:
             continue
 
-        # 从后往前扫描，取最新一条真正 METAR
+        # 从后往前扫描，取最新一条真正 METAR 且含 RMK+T 精确温度组
         for idx in range(len(times) - 1, -1, -1):
             if idx >= len(metars) or not metars[idx]:
                 continue
@@ -172,7 +172,7 @@ def _extract_weathergov_metars(
                 continue
 
             raw_metar = str(metars[idx]).strip()
-            if not raw_metar:
+            if not raw_metar or not _has_precision_temp(raw_metar):
                 continue
 
             obs_time = _parse_iso_time(times[idx]) or _parse_metar_time(raw_metar, _now_utc())
@@ -250,11 +250,19 @@ async def _fetch_weathergov_batch(
     return {}
 
 
+def _has_precision_temp(raw_text: str) -> bool:
+    """判断报文是否包含 RMK 精确温度组 Txxxx/Txxxxxxxx."""
+    return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}\b", raw_text))
+
+
 async def _fetch_awc_single(
     code: str,
     settings: Optional[Settings] = None,
 ) -> Optional[dict[str, Any]]:
-    """从 AviationWeather.gov 获取单个机场的 METAR."""
+    """从 AviationWeather.gov 获取单个机场的 METAR.
+
+    只接收含 RMK + T 精确温度组的 METAR/SPECI 报文；AUTO 报直接跳过。
+    """
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
 
@@ -278,14 +286,25 @@ async def _fetch_awc_single(
         if not items:
             return None
 
-        # 取最新一条
-        item = items[0]
-        raw_metar = item.get("rawOb")
-        if not raw_metar:
+        # 优先选择含 RMK+T 精确温度组的 METAR/SPECI；没有则跳过
+        selected = None
+        for item in items:
+            raw_metar = item.get("rawOb")
+            if not raw_metar:
+                continue
+            metar_type = item.get("metarType", "")
+            # 只接受 METAR 或 SPECI，且必须含 RMK + T 组
+            if metar_type in {"METAR", "SPECI"} and _has_precision_temp(raw_metar):
+                selected = item
+                break
+
+        if selected is None:
+            logger.debug("AviationWeather has no RMK+T METAR/SPECI for %s, skipping", code)
             return None
 
+        raw_metar = selected["rawOb"]
         obs_time = None
-        report_time = item.get("reportTime") or item.get("obsTime")
+        report_time = selected.get("reportTime") or selected.get("obsTime")
         if isinstance(report_time, (int, float)):
             obs_time = datetime.fromtimestamp(report_time, tz=timezone.utc)
         elif isinstance(report_time, str):

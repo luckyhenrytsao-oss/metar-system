@@ -30,11 +30,11 @@ def reset_http_client():
 
 @pytest.fixture
 def sample_awc_response():
-    """AWC API 成功响应示例."""
+    """AWC API 成功响应示例（含 RMK+T 精确温度组）."""
     return [
         {
             "icaoId": "KJFK",
-            "rawOb": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+            "rawOb": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
             "reportTime": "2026-07-05T04:55:00Z",
             "metarType": "METAR",
         }
@@ -43,7 +43,7 @@ def sample_awc_response():
 
 @pytest.fixture
 def sample_weathergov_response():
-    """weather.gov / SynopticData 成功响应示例."""
+    """weather.gov / SynopticData 成功响应示例（含 RMK+T 精确温度组）."""
     return {
         "STATION": [
             {
@@ -52,7 +52,7 @@ def sample_weathergov_response():
                 "OBSERVATIONS": {
                     "date_time": ["2026-07-05T04:50:00Z"],
                     "air_temp_set_1": [28.0],
-                    "metar_set_1": ["METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012"],
+                    "metar_set_1": ["METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
                     "metar_origin_set_1": [1.0],
                 },
             }
@@ -62,7 +62,7 @@ def sample_weathergov_response():
 
 @pytest.fixture
 def sample_weathergov_non_metar_response():
-    """weather.gov 返回非 METAR 来源观测（应被过滤）."""
+    """weather.gov 返回 AUTO 与真正 METAR；应过滤 AUTO，只保留带 RMK+T 的 METAR."""
     return {
         "STATION": [
             {
@@ -73,7 +73,7 @@ def sample_weathergov_non_metar_response():
                     "air_temp_set_1": [28.0, 27.0],
                     "metar_set_1": [
                         "METAR KAUS 050455Z AUTO 24008KT 10SM 28/20 A3012",
-                        "METAR KAUS 050450Z 24008KT 10SM 27/20 A3012",
+                        "METAR KAUS 050450Z 24008KT 10SM 27/20 A3012 RMK AO2 T02700200",
                     ],
                     "metar_origin_set_1": [None, 1.0],
                 },
@@ -180,13 +180,13 @@ async def test_store_if_changed_updates_on_different_text(fake_redis, test_setti
     """测试 SPECI/新 METAR 会覆盖旧数据."""
     old_data = {
         "icao": "KJFK",
-        "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+        "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
         "observed_at": "2026-07-05T04:55:00+00:00",
         "source": "aviationweather.gov",
     }
     new_data = {
         "icao": "KJFK",
-        "raw_text": "SPECI KJFK 050500Z 25012KT 10SM FEW250 24/17 A3010",
+        "raw_text": "SPECI KJFK 050500Z 25012KT 10SM FEW250 24/17 A3010 RMK AO2 T02400170",
         "observed_at": "2026-07-05T05:00:00+00:00",
         "source": "aviationweather.gov",
     }
@@ -220,7 +220,7 @@ async def test_fetch_airport_prefers_weathergov_then_awc(
         weathergov_batch = {
             "VHHH": {
                 "icao": "VHHH",
-                "raw_text": "METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012",
+                "raw_text": "METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260",
                 "observed_at": "2026-07-05T04:50:00+00:00",
                 "source": "weather.gov",
             }
@@ -272,7 +272,7 @@ def test_parse_metar_time_cross_day():
     """测试从 METAR 文本解析跨天边界的时间."""
     base = datetime(2026, 7, 5, 0, 30, tzinfo=timezone.utc)
     # 7 月 5 日 00:30，METAR 显示 2350Z，实际应为 7 月 4 日
-    raw = "METAR KJFK 042350Z 24008KT 10SM FEW250 25/18 A3012"
+    raw = "METAR KJFK 042350Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180"
     parsed = _parse_metar_time(raw, base)
     assert parsed is not None
     assert parsed.day == 4
