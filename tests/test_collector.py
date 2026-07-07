@@ -82,6 +82,29 @@ def sample_weathergov_non_metar_response():
     }
 
 
+@pytest.fixture
+def sample_weathergov_speci_response():
+    """weather.gov 返回 SPECI 与 METAR；应跳过 SPECI，只保留整点 METAR."""
+    return {
+        "STATION": [
+            {
+                "STID": "KSEA",
+                "MNET_ID": "1",
+                "OBSERVATIONS": {
+                    "date_time": [
+                        "2026-07-05T14:20:00Z",
+                        "2026-07-05T14:00:00Z",
+                    ],
+                    "air_temp_set_1": [13.9, 14.0],
+                    "metar_set_1": [
+                        "SPECI KSEA 051420Z 02010KT 10SM BKN011 BKN040 BKN200 14/10 A3015 RMK AO2 T01390100 $\n",
+                        "METAR KSEA 051400Z 02010KT 10SM BKN011 BKN040 BKN200 14/10 A3015 RMK AO2 T01400100",
+                    ],
+                    "metar_origin_set_1": [1.0, 1.0],
+                },
+            }
+        ]
+    }
 @pytest.mark.asyncio
 async def test_fetch_awc_single_success(fake_redis, test_settings, sample_awc_response):
     """测试从 AWC 成功获取单机场 METAR."""
@@ -133,6 +156,24 @@ async def test_fetch_weathergov_filters_non_metar_origin(
     # 应该跳过 AUTO（metar_origin_set_1=None）的记录，取更早的真正 METAR
     assert "050450Z" in results["KAUS"]["raw_text"]
     assert "AUTO" not in results["KAUS"]["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_weathergov_skips_speci(
+    fake_redis, test_settings, sample_weathergov_speci_response
+):
+    """测试 weather.gov 采集器跳过 SPECI，只保留整点 METAR."""
+    test_settings.weathergov_token = "fake-token-for-test"
+
+    with respx.mock:
+        respx.get("https://api.synopticdata.com/v2/stations/timeseries").mock(
+            return_value=Response(200, json=sample_weathergov_speci_response)
+        )
+        results = await _fetch_weathergov_batch(["KSEA"], test_settings)
+
+    assert "KSEA" in results
+    assert "SPECI" not in results["KSEA"]["raw_text"]
+    assert "051400Z" in results["KSEA"]["raw_text"]
 
 
 @pytest.mark.asyncio
