@@ -193,8 +193,11 @@ def _extract_weathergov_metars(
             continue
 
         raw_metar = str(metars[selected_idx]).strip()
-        obs_time = _parse_iso_time(times[selected_idx]) or _parse_metar_time(raw_metar, _now_utc())
+
+        # 统一从 rawOb 中的 ddHHMMZ 解析真实 METAR 时间
+        obs_time = _parse_metar_time(raw_metar, _now_utc())
         if obs_time is None:
+            logger.warning("Could not parse METAR time from rawOb for %s: %s", code, raw_metar[:80])
             continue
 
         results[code] = {
@@ -340,16 +343,12 @@ async def _fetch_awc_batch(
                 continue
 
             chosen_raw = chosen["rawOb"]
-            obs_time = None
-            report_time = chosen.get("reportTime") or chosen.get("obsTime")
-            if isinstance(report_time, (int, float)):
-                obs_time = datetime.fromtimestamp(report_time, tz=timezone.utc)
-            elif isinstance(report_time, str):
-                obs_time = _parse_iso_time(report_time)
+
+            # 统一从 rawOb 中的 ddHHMMZ 解析真实 METAR 时间
+            obs_time = _parse_metar_time(chosen_raw, _now_utc())
             if obs_time is None:
-                obs_time = _parse_metar_time(chosen_raw, _now_utc())
-            if obs_time is None:
-                obs_time = _now_utc()
+                logger.warning("Could not parse METAR time from rawOb for %s: %s", icao, chosen_raw[:80])
+                continue
 
             results[icao] = {
                 "icao": icao,

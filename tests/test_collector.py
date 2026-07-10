@@ -341,3 +341,111 @@ async def test_fetch_awc_handles_rate_limit(fake_redis, test_settings):
         )
         results = await _fetch_awc_batch(["KJFK"], test_settings)
     assert results == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_awc_batch_skips_missing_metar_time(fake_redis, test_settings):
+    """测试 AWC 返回的 rawOb 没有 ddHHMMZ 时间组时跳过该条."""
+    bad_response = [
+        {
+            "icaoId": "KJFK",
+            "rawOb": "METAR KJFK 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "METAR",
+        }
+    ]
+    with respx.mock:
+        respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=bad_response)
+        )
+        results = await _fetch_awc_batch(["KJFK"], test_settings)
+
+    assert "KJFK" not in results
+
+
+@pytest.mark.asyncio
+async def test_fetch_weathergov_batch_skips_missing_metar_time(fake_redis, test_settings):
+    """测试 weather.gov 返回的 rawOb 没有 ddHHMMZ 时间组时跳过该条."""
+    bad_response = {
+        "STATION": [
+            {
+                "STID": "VHHH",
+                "OBSERVATIONS": {
+                    "date_time": ["2026-07-05T04:50:00Z"],
+                    "metar_set_1": ["METAR VHHH 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
+                    "metar_origin_set_1": [1.0],
+                },
+            }
+        ]
+    }
+    test_settings.weathergov_token = "fake-token-for-test"
+
+    with respx.mock:
+        respx.get("https://api.synopticdata.com/v2/stations/timeseries").mock(
+            return_value=Response(200, json=bad_response)
+        )
+        results = await _fetch_weathergov_batch(["VHHH"], test_settings)
+
+    assert "VHHH" not in results
+
+
+@pytest.mark.asyncio
+async def test_fetch_awc_batch_uses_raw_ob_time_not_report_time(fake_redis, test_settings, monkeypatch):
+    """测试 AWC 使用 rawOb 中的 ddHHMMZ 作为 observed_at, 而非 reportTime."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+    )
+
+    response = [
+        {
+            "icaoId": "KJFK",
+            "rawOb": "METAR KJFK 050430Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "METAR",
+        }
+    ]
+    with respx.mock:
+        respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=response)
+        )
+        results = await _fetch_awc_batch(["KJFK"], test_settings)
+
+    assert "KJFK" in results
+    assert results["KJFK"]["observed_at"] == "2026-07-05T04:30:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_fetch_weathergov_batch_uses_raw_ob_time_not_date_time(fake_redis, test_settings, monkeypatch):
+    """测试 weather.gov 使用 rawOb 中的 ddHHMMZ 作为 observed_at, 而非 date_time."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+    )
+
+    response = {
+        "STATION": [
+            {
+                "STID": "VHHH",
+                "OBSERVATIONS": {
+                    "date_time": ["2026-07-05T04:55:00Z"],
+                    "metar_set_1": ["METAR VHHH 050430Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
+                    "metar_origin_set_1": [1.0],
+                },
+            }
+        ]
+    }
+    test_settings.weathergov_token = "fake-token-for-test"
+
+    with respx.mock:
+        respx.get("https://api.synopticdata.com/v2/stations/timeseries").mock(
+            return_value=Response(200, json=response)
+        )
+        results = await _fetch_weathergov_batch(["VHHH"], test_settings)
+
+    assert "VHHH" in results
+    assert results["VHHH"]["observed_at"] == "2026-07-05T04:30:00+00:00"
