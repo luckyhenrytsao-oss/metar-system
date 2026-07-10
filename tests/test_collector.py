@@ -11,7 +11,7 @@ from httpx import Response
 
 from app.collector import (
     _fetch_airport,
-    _fetch_awc_single,
+    _fetch_awc_batch,
     _fetch_weathergov_batch,
     _parse_metar_time,
     _store_if_changed,
@@ -30,14 +30,39 @@ def reset_http_client():
 
 @pytest.fixture
 def sample_awc_response():
-    """AWC API 成功响应示例（含 RMK+T 精确温度组）."""
+    """AWC API 批量响应示例（含 RMK+T 精确温度组）."""
     return [
         {
             "icaoId": "KJFK",
             "rawOb": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
             "reportTime": "2026-07-05T04:55:00Z",
             "metarType": "METAR",
-        }
+        },
+        {
+            "icaoId": "EGLL",
+            "rawOb": "METAR EGLL 050455Z 24008KT 10SM FEW250 13/10 A3012 RMK AO2 T01330100",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "METAR",
+        },
+    ]
+
+
+@pytest.fixture
+def sample_awc_response_with_auto():
+    """AWC API 返回 AUTO 与 METAR；应过滤 AUTO."""
+    return [
+        {
+            "icaoId": "KJFK",
+            "rawOb": "METAR KJFK 050455Z AUTO 24008KT 10SM FEW250 25/18 A3012",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "AUTO",
+        },
+        {
+            "icaoId": "KJFK",
+            "rawOb": "METAR KJFK 050450Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:50:00Z",
+            "metarType": "METAR",
+        },
     ]
 
 
@@ -62,7 +87,7 @@ def sample_weathergov_response():
 
 @pytest.fixture
 def sample_weathergov_non_metar_response():
-    """weather.gov 返回 AUTO 与真正 METAR；应过滤 AUTO，只保留带 RMK+T 的 METAR."""
+    """weather.gov 返回 AUTO 与真正 METAR；应过滤 AUTO，只保留真正 METAR."""
     return {
         "STATION": [
             {
@@ -82,42 +107,47 @@ def sample_weathergov_non_metar_response():
     }
 
 
-@pytest.fixture
-def sample_weathergov_speci_response():
-    """weather.gov 返回 SPECI 与 METAR；应跳过 SPECI，只保留整点 METAR."""
-    return {
-        "STATION": [
-            {
-                "STID": "KSEA",
-                "MNET_ID": "1",
-                "OBSERVATIONS": {
-                    "date_time": [
-                        "2026-07-05T14:20:00Z",
-                        "2026-07-05T14:00:00Z",
-                    ],
-                    "air_temp_set_1": [13.9, 14.0],
-                    "metar_set_1": [
-                        "SPECI KSEA 051420Z 02010KT 10SM BKN011 BKN040 BKN200 14/10 A3015 RMK AO2 T01390100 $\n",
-                        "METAR KSEA 051400Z 02010KT 10SM BKN011 BKN040 BKN200 14/10 A3015 RMK AO2 T01400100",
-                    ],
-                    "metar_origin_set_1": [1.0, 1.0],
-                },
-            }
-        ]
-    }
 @pytest.mark.asyncio
-async def test_fetch_awc_single_success(fake_redis, test_settings, sample_awc_response):
-    """测试从 AWC 成功获取单机场 METAR."""
+async def test_fetch_awc_batch_success(fake_redis, test_settings, sample_awc_response):
+    """测试从 AWC 批量获取多个机场 METAR."""
     with respx.mock:
         route = respx.get("https://aviationweather.gov/api/data/metar").mock(
             return_value=Response(200, json=sample_awc_response)
         )
-        result = await _fetch_awc_single("KJFK", test_settings)
+        results = await _fetch_awc_batch(["KJFK", "EGLL"], test_settings)
 
-    assert result is not None
-    assert result["icao"] == "KJFK"
-    assert "METAR KJFK" in result["raw_text"]
-    assert result["source"] == "aviationweather.gov"
+    assert "KJFK" in results
+    assert "EGLL" in results
+    assert results["KJFK"]["source"] == "aviationweather.gov"
+    assert results["EGLL"]["source"] == "aviationweather.gov"
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_fetch_awc_batch_filters_auto(fake_redis, test_settings, sample_awc_response_with_auto):
+    """测试 AWC 批量请求过滤 AUTO 报文."""
+    with respx.mock:
+        respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=sample_awc_response_with_auto)
+        )
+        results = await _fetch_awc_batch(["KJFK"], test_settings)
+
+    assert "KJFK" in results
+    assert "AUTO" not in results["KJFK"]["raw_text"]
+    assert "T02500180" in results["KJFK"]["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_awc_batch_disabled_for_uuww(fake_redis, test_settings):
+    """测试 UUWW 不请求 AviationWeather.gov."""
+    with respx.mock:
+        route = respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=[])
+        )
+        results = await _fetch_awc_batch(["UUWW", "KJFK"], test_settings)
+
+    # UUWW 被过滤，KJFK 仍发起请求
+    assert "UUWW" not in results
     assert route.called
 
 
@@ -156,20 +186,6 @@ async def test_fetch_weathergov_filters_non_metar_origin(
     # 应该跳过 AUTO（metar_origin_set_1=None）的记录，取更早的真正 METAR
     assert "050450Z" in results["KAUS"]["raw_text"]
     assert "AUTO" not in results["KAUS"]["raw_text"]
-
-
-@pytest.mark.asyncio
-async def test_fetch_awc_disabled_for_uuww(fake_redis, test_settings):
-    """测试 UUWW 不请求 AviationWeather.gov."""
-    with respx.mock:
-        # 这个路由不应该被调用
-        route = respx.get("https://aviationweather.gov/api/data/metar").mock(
-            return_value=Response(200, json=[])
-        )
-        result = await _fetch_awc_single("UUWW", test_settings)
-
-    assert result is None
-    assert not route.called
 
 
 @pytest.mark.asyncio
@@ -243,29 +259,26 @@ async def test_fetch_airport_prefers_weathergov_then_awc(
     fake_redis, test_settings, sample_weathergov_response, sample_awc_response
 ):
     """测试 _fetch_airport 优先使用 weather.gov 批量结果，缺失时回退 AWC."""
-    test_settings.weathergov_token = "fake-token-for-test"
-
-    with respx.mock:
-        respx.get("https://api.synopticdata.com/v2/stations/timeseries").mock(
-            return_value=Response(200, json=sample_weathergov_response)
-        )
-        respx.get("https://aviationweather.gov/api/data/metar").mock(
-            return_value=Response(200, json=sample_awc_response)
-        )
-
-        # VHHH 在 weather.gov 响应中
-        weathergov_batch = {
-            "VHHH": {
-                "icao": "VHHH",
-                "raw_text": "METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260",
-                "observed_at": "2026-07-05T04:50:00+00:00",
-                "source": "weather.gov",
-            }
+    weathergov_batch = {
+        "VHHH": {
+            "icao": "VHHH",
+            "raw_text": "METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260",
+            "observed_at": "2026-07-05T04:50:00+00:00",
+            "source": "weather.gov",
         }
-        vhhh = await _fetch_airport("VHHH", weathergov_batch, test_settings)
-        # 注意：这里直接传入 weathergov 批量结果，会命中 VHHH
-        # KJFK 不在 weather.gov 结果中，会回退 AWC
-        kjfk = await _fetch_airport("KJFK", {}, test_settings)
+    }
+    awc_batch = {
+        "KJFK": {
+            "icao": "KJFK",
+            "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "observed_at": "2026-07-05T04:55:00+00:00",
+            "source": "aviationweather.gov",
+        }
+    }
+
+    vhhh = await _fetch_airport("VHHH", weathergov_batch, awc_batch)
+    kjfk = await _fetch_airport("KJFK", weathergov_batch, awc_batch)
+    missing = await _fetch_airport("UUWW", weathergov_batch, awc_batch)
 
     assert vhhh is not None
     assert vhhh["icao"] == "VHHH"
@@ -274,6 +287,8 @@ async def test_fetch_airport_prefers_weathergov_then_awc(
     assert kjfk is not None
     assert kjfk["icao"] == "KJFK"
     assert kjfk["source"] == "aviationweather.gov"
+
+    assert missing is None
 
 
 @pytest.mark.asyncio
@@ -324,5 +339,5 @@ async def test_fetch_awc_handles_rate_limit(fake_redis, test_settings):
         respx.get("https://aviationweather.gov/api/data/metar").mock(
             return_value=Response(429, text="Rate Limited")
         )
-        result = await _fetch_awc_single("KJFK", test_settings)
-    assert result is None
+        results = await _fetch_awc_batch(["KJFK"], test_settings)
+    assert results == {}

@@ -276,25 +276,24 @@ def _has_precision_temp(raw_text: str) -> bool:
 AWC_DISABLED_AIRPORTS = {"UUWW"}
 
 
-async def _fetch_awc_single(
-    code: str,
+async def _fetch_awc_batch(
+    codes: list[str],
     settings: Optional[Settings] = None,
-) -> Optional[dict[str, Any]]:
-    """从 AviationWeather.gov 获取单个机场的 METAR.
+) -> dict[str, dict[str, Any]]:
+    """从 AviationWeather.gov 批量获取多个机场的 METAR.
 
     只接收 METAR/SPECI 报文；AUTO 报直接跳过。
     优先选择含 RMK+T 精确温度组的报文，没有则保留普通 METAR/SPECI。
     """
-    code = code.upper()
-    if code in AWC_DISABLED_AIRPORTS:
-        logger.debug("AviationWeather disabled for %s, skipping", code)
-        return None
-
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
 
+    requested_codes = {code.upper() for code in codes if code.upper() not in AWC_DISABLED_AIRPORTS}
+    if not requested_codes:
+        return {}
+
     params = {
-        "ids": code,
+        "ids": ",".join(sorted(requested_codes)),
         "format": "json",
         "hours": "1",
     }
@@ -305,73 +304,78 @@ async def _fetch_awc_single(
             timeout=httpx.Timeout(cfg.http_timeout, connect=5.0),
         )
         if resp.status_code == 429:
-            logger.warning("AviationWeather rate limited (429) for %s", code)
-            return None
+            logger.warning("AviationWeather rate limited (429) for batch")
+            return {}
         resp.raise_for_status()
         data = resp.json()
         items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
-        if not items:
-            return None
 
-        # 优先选择含 RMK+T 精确温度组的 METAR/SPECI；
-        # 没有精确组时，保留普通 METAR/SPECI；AUTO 报跳过。
-        selected: Optional[dict[str, Any]] = None
-        fallback: Optional[dict[str, Any]] = None
+        results: dict[str, dict[str, Any]] = {}
         for item in items:
             raw_metar = item.get("rawOb")
-            if not raw_metar:
+            icao = item.get("icaoId", "").upper()
+            if not raw_metar or icao not in requested_codes:
                 continue
+
             metar_type = item.get("metarType", "")
             if metar_type not in {"METAR", "SPECI"}:
                 continue
+
+            # 同一机场可能返回多条记录，优先保留带 RMK+T 的
+            existing = results.get(icao)
+            if existing and _has_precision_temp(existing["raw_text"]):
+                continue
+
             if _has_precision_temp(raw_metar):
                 selected = item
-                break
-            if fallback is None:
+                fallback = None
+            elif existing is None:
+                selected = None
                 fallback = item
+            else:
+                continue
 
-        selected = selected or fallback
-        if selected is None:
-            logger.debug("AviationWeather has no METAR/SPECI for %s, skipping", code)
-            return None
+            chosen = selected or fallback
+            if chosen is None:
+                continue
 
-        raw_metar = selected["rawOb"]
-        obs_time = None
-        report_time = selected.get("reportTime") or selected.get("obsTime")
-        if isinstance(report_time, (int, float)):
-            obs_time = datetime.fromtimestamp(report_time, tz=timezone.utc)
-        elif isinstance(report_time, str):
-            obs_time = _parse_iso_time(report_time)
-        if obs_time is None:
-            obs_time = _parse_metar_time(raw_metar, _now_utc())
-        if obs_time is None:
-            obs_time = _now_utc()
+            chosen_raw = chosen["rawOb"]
+            obs_time = None
+            report_time = chosen.get("reportTime") or chosen.get("obsTime")
+            if isinstance(report_time, (int, float)):
+                obs_time = datetime.fromtimestamp(report_time, tz=timezone.utc)
+            elif isinstance(report_time, str):
+                obs_time = _parse_iso_time(report_time)
+            if obs_time is None:
+                obs_time = _parse_metar_time(chosen_raw, _now_utc())
+            if obs_time is None:
+                obs_time = _now_utc()
 
-        return {
-            "icao": code.upper(),
-            "raw_text": str(raw_metar).strip(),
-            "observed_at": obs_time.isoformat(),
-            "source": "aviationweather.gov",
-        }
+            results[icao] = {
+                "icao": icao,
+                "raw_text": str(chosen_raw).strip(),
+                "observed_at": obs_time.isoformat(),
+                "source": "aviationweather.gov",
+            }
+
+        return results
     except httpx.HTTPError as exc:
-        logger.error("AviationWeather fetch error for %s: %s", code, exc)
+        logger.error("AviationWeather batch fetch error: %s", exc)
     except (json.JSONDecodeError, TypeError) as exc:
-        logger.error("AviationWeather invalid JSON for %s: %s", code, exc)
-    return None
+        logger.error("AviationWeather invalid JSON: %s", exc)
+    return {}
 
 
 async def _fetch_airport(
     code: str,
     weathergov_batch: dict[str, dict[str, Any]],
-    settings: Optional[Settings] = None,
+    awc_batch: dict[str, dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    """获取单个机场的 METAR：优先使用 weather.gov 批量结果，否则回退 AWC."""
+    """获取单个机场的 METAR：优先 weather.gov，其次 AWC."""
     code = code.upper()
     if code in weathergov_batch:
         return weathergov_batch[code]
-
-    # weather.gov 批量中没有该机场，尝试 AWC
-    return await _fetch_awc_single(code, settings)
+    return awc_batch.get(code)
 
 
 def _compute_hash(raw_text: str) -> str:
@@ -410,21 +414,29 @@ async def _store_if_changed(
 
 
 async def _poll_cycle(settings: Optional[Settings] = None) -> None:
-    """执行一轮采集：先批量 weather.gov，再为缺失机场回退 AWC."""
+    """执行一轮采集：先批量 weather.gov，再批量回退 AWC."""
     cfg = settings or get_settings()
     redis_client = await get_redis(cfg)
 
     # 1. 批量从 weather.gov 获取所有监控机场
     weathergov_results = await _fetch_weathergov_batch(cfg.monitor_airports_list, cfg)
 
-    # 2. 对每个机场并发回退 AWC
+    # 2. 找出 weather.gov 未覆盖且未禁用 AWC 的机场，批量请求 AWC
+    awc_candidates = [
+        code
+        for code in cfg.monitor_airports_list
+        if code.upper() not in weathergov_results
+        and code.upper() not in AWC_DISABLED_AIRPORTS
+    ]
+    awc_results = await _fetch_awc_batch(awc_candidates, cfg) if awc_candidates else {}
+
+    # 3. 合并结果并写入 Redis（去重）
     tasks = [
-        _fetch_airport(code, weathergov_results, cfg)
+        _fetch_airport(code, weathergov_results, awc_results)
         for code in cfg.monitor_airports_list
     ]
     airport_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 3. 写入 Redis（去重）
     for code, result in zip(cfg.monitor_airports_list, airport_results):
         if isinstance(result, Exception):
             logger.error("Unexpected exception fetching %s: %s", code, result)
