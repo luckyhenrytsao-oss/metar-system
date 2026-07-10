@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 import app.database
 import app.main
 from app.config import Settings, get_settings
-from app.database import _redis_pool, close_redis
+from app.database import close_redis
 
 
 # 设置默认事件循环策略为 asyncio（pytest-asyncio 0.23+ 推荐）
@@ -67,6 +67,7 @@ def test_client(fake_redis, test_settings, monkeypatch) -> TestClient:
     - 通过 monkeypatch 让 app.main/app.database 中的 get_redis 返回 fake_redis
     - lifespan="off" 防止后台采集器在测试期间连接真实数据源
     """
+
     # 注入 FakeRedis 到 lifespan 中直接调用的 get_redis（允许接收 settings 参数）
     async def _fake_get_redis_lifespan(*args, **kwargs):
         return fake_redis
@@ -85,7 +86,9 @@ def test_client(fake_redis, test_settings, monkeypatch) -> TestClient:
     async def _fake_get_redis_dep():
         return fake_redis
 
-    app.main.app.dependency_overrides[app.main._get_redis_dependency] = _fake_get_redis_dep
+    app.main.app.dependency_overrides[app.main._get_redis_dependency] = (
+        _fake_get_redis_dep
+    )
 
     with TestClient(app.main.app) as client:
         yield client

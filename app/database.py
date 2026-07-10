@@ -44,7 +44,7 @@ async def close_redis() -> None:
 
 
 async def get_metar(redis_client: redis.Redis, icao: str) -> Optional[dict[str, Any]]:
-    """从 Redis 读取单个机场的 METAR 数据."""
+    """从 Redis 读取单个机场的 METAR 数据（已择优后的最终记录）."""
     raw = await redis_client.get(f"metar:{icao.upper()}")
     if raw is None:
         return None
@@ -72,6 +72,54 @@ async def set_metar(
 async def get_existing_hash(redis_client: redis.Redis, icao: str) -> Optional[str]:
     """读取某机场当前存储的 hash，用于去重."""
     data = await get_metar(redis_client, icao)
+    if data is None:
+        return None
+    return data.get("hash")
+
+
+async def get_source_metar(
+    redis_client: redis.Redis,
+    icao: str,
+    source: str,
+) -> Optional[dict[str, Any]]:
+    """读取指定数据源的最新 METAR 记录.
+
+    source 取值:
+      - "weathergov" -> weather.gov / SynopticData
+      - "awc" -> aviationweather.gov
+    """
+    raw = await redis_client.get(f"metar:{icao.upper()}:source:{source}")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Corrupted source METAR data in Redis for %s/%s", icao, source)
+        return None
+
+
+async def set_source_metar(
+    redis_client: redis.Redis,
+    icao: str,
+    source: str,
+    data: dict[str, Any],
+    ttl_seconds: int,
+) -> None:
+    """写入指定数据源的 METAR 记录并设置 TTL."""
+    await redis_client.set(
+        f"metar:{icao.upper()}:source:{source}",
+        json.dumps(data, ensure_ascii=False, sort_keys=True),
+        ex=ttl_seconds,
+    )
+
+
+async def get_existing_source_hash(
+    redis_client: redis.Redis,
+    icao: str,
+    source: str,
+) -> Optional[str]:
+    """读取某机场指定数据源当前存储的 hash，用于去重."""
+    data = await get_source_metar(redis_client, icao, source)
     if data is None:
         return None
     return data.get("hash")

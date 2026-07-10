@@ -109,7 +109,9 @@ class Settings(BaseSettings):
     @property
     def monitor_airports_list(self) -> List[str]:
         """返回监控机场列表（List[str] 形式）."""
-        return [code.strip() for code in self.monitor_airports.split(",") if code.strip()]
+        return [
+            code.strip() for code in self.monitor_airports.split(",") if code.strip()
+        ]
 
     @field_validator("log_level")
     @classmethod

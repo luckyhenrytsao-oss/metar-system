@@ -77,13 +77,19 @@ async def _get_weathergov_token(settings: Optional[Settings] = None) -> Optional
     global _weathergov_token, _weathergov_token_expires
     async with _token_lock:
         now = _now_utc()
-        if _weathergov_token and _weathergov_token_expires and now < _weathergov_token_expires:
+        if (
+            _weathergov_token
+            and _weathergov_token_expires
+            and now < _weathergov_token_expires
+        ):
             return _weathergov_token
 
         client = _get_http_client(cfg)
         try:
             # 请求 token 页面时不带 Referer，避免被限制；设置独立超时防止 hang 住
-            resp = await client.get(WEATHERGOV_TOKEN_URL, timeout=httpx.Timeout(10.0, connect=5.0))
+            resp = await client.get(
+                WEATHERGOV_TOKEN_URL, timeout=httpx.Timeout(10.0, connect=5.0)
+            )
             resp.raise_for_status()
             match = re.search(r"mesoToken\s*=\s*['\"]([A-Fa-f0-9]+)['\"]", resp.text)
             if match:
@@ -107,7 +113,9 @@ def _parse_iso_time(value: str) -> Optional[datetime]:
     except ValueError:
         pass
     try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
     except ValueError:
         return None
 
@@ -120,7 +128,9 @@ def _parse_metar_time(raw_metar: str, base_time: datetime) -> Optional[datetime]
     if not match:
         return None
     day, hour, minute = map(int, match.groups())
-    dt = datetime(base_time.year, base_time.month, day, hour, minute, tzinfo=timezone.utc)
+    dt = datetime(
+        base_time.year, base_time.month, day, hour, minute, tzinfo=timezone.utc
+    )
     # 处理跨天/跨月边界
     diff = (dt - base_time).total_seconds()
     if diff > 43200:
@@ -197,7 +207,9 @@ def _extract_weathergov_metars(
         # 统一从 rawOb 中的 ddHHMMZ 解析真实 METAR 时间
         obs_time = _parse_metar_time(raw_metar, _now_utc())
         if obs_time is None:
-            logger.warning("Could not parse METAR time from rawOb for %s: %s", code, raw_metar[:80])
+            logger.warning(
+                "Could not parse METAR time from rawOb for %s: %s", code, raw_metar[:80]
+            )
             continue
 
         results[code] = {
@@ -291,7 +303,9 @@ async def _fetch_awc_batch(
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
 
-    requested_codes = {code.upper() for code in codes if code.upper() not in AWC_DISABLED_AIRPORTS}
+    requested_codes = {
+        code.upper() for code in codes if code.upper() not in AWC_DISABLED_AIRPORTS
+    }
     if not requested_codes:
         return {}
 
@@ -311,7 +325,9 @@ async def _fetch_awc_batch(
             return {}
         resp.raise_for_status()
         data = resp.json()
-        items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        items = (
+            data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        )
 
         results: dict[str, dict[str, Any]] = {}
         for item in items:
@@ -347,7 +363,11 @@ async def _fetch_awc_batch(
             # 统一从 rawOb 中的 ddHHMMZ 解析真实 METAR 时间
             obs_time = _parse_metar_time(chosen_raw, _now_utc())
             if obs_time is None:
-                logger.warning("Could not parse METAR time from rawOb for %s: %s", icao, chosen_raw[:80])
+                logger.warning(
+                    "Could not parse METAR time from rawOb for %s: %s",
+                    icao,
+                    chosen_raw[:80],
+                )
                 continue
 
             results[icao] = {
@@ -382,21 +402,87 @@ def _compute_hash(raw_text: str) -> str:
     return hashlib.sha1(raw_text.encode("utf-8")).hexdigest()
 
 
-async def _store_if_changed(
+def _parse_observed_at(value: Any) -> Optional[datetime]:
+    """将 observed_at 字符串解析为 UTC datetime."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _select_winner(
+    weathergov_record: Optional[dict[str, Any]],
+    awc_record: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """从两个数据源记录中选择优胜者.
+
+    选择规则:
+      1. 优先比较 observed_at：时间更晚（更新）的记录胜出
+      2. 若 observed_at 相同，比较入库延迟（updated_at - observed_at），延迟更小的胜出
+      3. 若仍相同，默认优先 weather.gov
+      4. 只有一方有数据时，直接使用该方
+    """
+    if weathergov_record is None:
+        return awc_record
+    if awc_record is None:
+        return weathergov_record
+
+    wg_obs = _parse_observed_at(weathergov_record.get("observed_at"))
+    awc_obs = _parse_observed_at(awc_record.get("observed_at"))
+
+    if wg_obs is None and awc_obs is None:
+        return weathergov_record
+    if wg_obs is None:
+        return awc_record
+    if awc_obs is None:
+        return weathergov_record
+
+    # 规则 1：更新鲜的 METAR 胜出
+    if wg_obs > awc_obs:
+        return weathergov_record
+    if awc_obs > wg_obs:
+        return awc_record
+
+    # observed_at 相同，比较延迟
+    wg_updated = _parse_observed_at(weathergov_record.get("updated_at"))
+    awc_updated = _parse_observed_at(awc_record.get("updated_at"))
+
+    wg_latency = (wg_updated - wg_obs).total_seconds() if wg_updated else float("inf")
+    awc_latency = (
+        (awc_updated - awc_obs).total_seconds() if awc_updated else float("inf")
+    )
+
+    if awc_latency < wg_latency:
+        return awc_record
+    return weathergov_record
+
+
+async def _store_source_if_changed(
     redis_client: Any,
     icao: str,
+    source: str,
     metar_data: dict[str, Any],
     settings: Optional[Settings] = None,
 ) -> bool:
-    """如果 METAR 文本有变化，则写入 Redis 并返回 True."""
+    """如果某个数据源的 METAR 文本有变化，则写入该数据源专属 Key 并返回 True."""
     cfg = settings or get_settings()
     icao = icao.upper()
     raw_text = metar_data["raw_text"]
     new_hash = _compute_hash(raw_text)
 
-    existing_hash = await get_existing_hash(redis_client, icao)
+    from app.database import get_existing_source_hash
+
+    existing_hash = await get_existing_source_hash(redis_client, icao, source)
     if existing_hash == new_hash:
-        logger.debug("METAR unchanged for %s, skipping write", icao)
+        logger.debug("METAR unchanged for %s/%s, skipping write", icao, source)
         return False
 
     payload = {
@@ -406,47 +492,110 @@ async def _store_if_changed(
         "updated_at": _now_utc().isoformat(),
         "hash": new_hash,
         "source": metar_data.get("source", "unknown"),
+        "source_key": source,
     }
-    await set_metar(redis_client, icao, payload, cfg.metar_ttl_seconds)
-    logger.info("METAR updated for %s (hash=%s... source=%s)", icao, new_hash[:8], payload["source"])
+
+    from app.database import set_source_metar
+
+    await set_source_metar(redis_client, icao, source, payload, cfg.metar_ttl_seconds)
+    logger.info(
+        "Source METAR updated for %s/%s (hash=%s... source=%s)",
+        icao,
+        source,
+        new_hash[:8],
+        payload["source"],
+    )
     return True
 
 
+async def _store_winner_if_changed(
+    redis_client: Any,
+    icao: str,
+    winner: dict[str, Any],
+    settings: Optional[Settings] = None,
+) -> bool:
+    """如果择优后的 METAR 文本有变化，则写入最终 Key 并返回 True."""
+    cfg = settings or get_settings()
+    icao = icao.upper()
+    raw_text = winner["raw_text"]
+    new_hash = _compute_hash(raw_text)
+
+    existing_hash = await get_existing_hash(redis_client, icao)
+    if existing_hash == new_hash:
+        logger.debug("Adopted METAR unchanged for %s, skipping write", icao)
+        return False
+
+    payload = {
+        "icao": icao,
+        "raw_text": raw_text,
+        "observed_at": winner.get("observed_at") or _now_utc().isoformat(),
+        "updated_at": _now_utc().isoformat(),
+        "hash": new_hash,
+        "source": winner.get("source", "unknown"),
+        "source_key": winner.get("source_key", "unknown"),
+    }
+    await set_metar(redis_client, icao, payload, cfg.metar_ttl_seconds)
+    logger.info(
+        "Adopted METAR updated for %s (hash=%s... source=%s/%s)",
+        icao,
+        new_hash[:8],
+        payload["source"],
+        payload["source_key"],
+    )
+    return True
+
+
+async def _merge_and_store_winners(
+    redis_client: Any,
+    settings: Optional[Settings] = None,
+) -> None:
+    """为每个监控机场读取两个数据源记录，择优后写入最终 Key."""
+    cfg = settings or get_settings()
+    from app.database import get_source_metar
+
+    for code in cfg.monitor_airports_list:
+        icao = code.upper()
+        try:
+            weathergov_record = await get_source_metar(redis_client, icao, "weathergov")
+            awc_record = await get_source_metar(redis_client, icao, "awc")
+            winner = _select_winner(weathergov_record, awc_record)
+            if winner is None:
+                logger.warning("No METAR data available for %s", icao)
+                continue
+            await _store_winner_if_changed(redis_client, icao, winner, cfg)
+        except Exception as exc:
+            logger.error("Failed to merge/store winner for %s: %s", icao, exc)
+
+
 async def _poll_cycle(settings: Optional[Settings] = None) -> None:
-    """执行一轮采集：先批量 weather.gov，再批量回退 AWC."""
+    """执行一轮采集：两个数据源独立批量采集，分别入库，再择优合并."""
     cfg = settings or get_settings()
     redis_client = await get_redis(cfg)
 
-    # 1. 批量从 weather.gov 获取所有监控机场
-    weathergov_results = await _fetch_weathergov_batch(cfg.monitor_airports_list, cfg)
+    # 1. 独立批量采集：weather.gov 采集全部机场，AWC 采集全部机场（除黑名单）
+    weathergov_results, awc_results = await asyncio.gather(
+        _fetch_weathergov_batch(cfg.monitor_airports_list, cfg),
+        _fetch_awc_batch(cfg.monitor_airports_list, cfg),
+    )
 
-    # 2. 找出 weather.gov 未覆盖且未禁用 AWC 的机场，批量请求 AWC
-    awc_candidates = [
-        code
-        for code in cfg.monitor_airports_list
-        if code.upper() not in weathergov_results
-        and code.upper() not in AWC_DISABLED_AIRPORTS
-    ]
-    awc_results = await _fetch_awc_batch(awc_candidates, cfg) if awc_candidates else {}
-
-    # 3. 合并结果并写入 Redis（去重）
-    tasks = [
-        _fetch_airport(code, weathergov_results, awc_results)
-        for code in cfg.monitor_airports_list
-    ]
-    airport_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for code, result in zip(cfg.monitor_airports_list, airport_results):
-        if isinstance(result, Exception):
-            logger.error("Unexpected exception fetching %s: %s", code, result)
-            continue
-        if result is None:
-            logger.warning("No METAR data available for %s", code)
-            continue
+    # 2. 将 weather.gov 结果写入 source-specific Key
+    for code, result in weathergov_results.items():
         try:
-            await _store_if_changed(redis_client, code, result, cfg)
+            await _store_source_if_changed(
+                redis_client, code, "weathergov", result, cfg
+            )
         except Exception as exc:
-            logger.error("Failed to store METAR for %s: %s", code, exc)
+            logger.error("Failed to store weather.gov METAR for %s: %s", code, exc)
+
+    # 3. 将 AWC 结果写入 source-specific Key
+    for code, result in awc_results.items():
+        try:
+            await _store_source_if_changed(redis_client, code, "awc", result, cfg)
+        except Exception as exc:
+            logger.error("Failed to store AWC METAR for %s: %s", code, exc)
+
+    # 4. 为每个机场择优并写入最终 Key
+    await _merge_and_store_winners(redis_client, cfg)
 
 
 async def start_collector_loop(settings: Optional[Settings] = None) -> None:

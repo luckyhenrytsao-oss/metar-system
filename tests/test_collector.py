@@ -13,12 +13,14 @@ from app.collector import (
     _fetch_airport,
     _fetch_awc_batch,
     _fetch_weathergov_batch,
+    _merge_and_store_winners,
     _parse_metar_time,
-    _store_if_changed,
+    _select_winner,
+    _store_source_if_changed,
+    _store_winner_if_changed,
     close_http_client,
     start_collector_loop,
 )
-from app.config import Settings
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +79,9 @@ def sample_weathergov_response():
                 "OBSERVATIONS": {
                     "date_time": ["2026-07-05T04:50:00Z"],
                     "air_temp_set_1": [28.0],
-                    "metar_set_1": ["METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
+                    "metar_set_1": [
+                        "METAR VHHH 050450Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"
+                    ],
                     "metar_origin_set_1": [1.0],
                 },
             }
@@ -124,7 +128,9 @@ async def test_fetch_awc_batch_success(fake_redis, test_settings, sample_awc_res
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_filters_auto(fake_redis, test_settings, sample_awc_response_with_auto):
+async def test_fetch_awc_batch_filters_auto(
+    fake_redis, test_settings, sample_awc_response_with_auto
+):
     """测试 AWC 批量请求过滤 AUTO 报文."""
     with respx.mock:
         respx.get("https://aviationweather.gov/api/data/metar").mock(
@@ -189,8 +195,8 @@ async def test_fetch_weathergov_filters_non_metar_origin(
 
 
 @pytest.mark.asyncio
-async def test_store_if_changed_writes_new_data(fake_redis, test_settings):
-    """测试首次写入 Redis 成功."""
+async def test_store_source_if_changed_writes_new_data(fake_redis, test_settings):
+    """测试首次写入数据源专属 Redis Key 成功."""
     metar_data = {
         "icao": "KJFK",
         "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
@@ -198,22 +204,25 @@ async def test_store_if_changed_writes_new_data(fake_redis, test_settings):
         "source": "aviationweather.gov",
     }
 
-    written = await _store_if_changed(fake_redis, "KJFK", metar_data, test_settings)
+    written = await _store_source_if_changed(
+        fake_redis, "KJFK", "awc", metar_data, test_settings
+    )
     assert written is True
 
-    from app.database import get_metar
+    from app.database import get_source_metar
 
-    stored = await get_metar(fake_redis, "KJFK")
+    stored = await get_source_metar(fake_redis, "KJFK", "awc")
     assert stored is not None
     assert stored["icao"] == "KJFK"
     assert stored["raw_text"] == metar_data["raw_text"]
     assert "hash" in stored
     assert "updated_at" in stored
+    assert stored["source_key"] == "awc"
 
 
 @pytest.mark.asyncio
-async def test_store_if_changed_skips_duplicate(fake_redis, test_settings):
-    """测试相同 METAR 文本不会重复写入 Redis."""
+async def test_store_source_if_changed_skips_duplicate(fake_redis, test_settings):
+    """测试相同 METAR 文本不会重复写入数据源专属 Key."""
     metar_data = {
         "icao": "KJFK",
         "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
@@ -221,37 +230,48 @@ async def test_store_if_changed_skips_duplicate(fake_redis, test_settings):
         "source": "aviationweather.gov",
     }
 
-    first = await _store_if_changed(fake_redis, "KJFK", metar_data, test_settings)
+    first = await _store_source_if_changed(
+        fake_redis, "KJFK", "awc", metar_data, test_settings
+    )
     assert first is True
 
-    second = await _store_if_changed(fake_redis, "KJFK", metar_data, test_settings)
+    second = await _store_source_if_changed(
+        fake_redis, "KJFK", "awc", metar_data, test_settings
+    )
     assert second is False
 
 
 @pytest.mark.asyncio
-async def test_store_if_changed_updates_on_different_text(fake_redis, test_settings):
-    """测试 SPECI/新 METAR 会覆盖旧数据."""
-    old_data = {
+async def test_store_winner_if_changed_updates_on_different_text(
+    fake_redis, test_settings
+):
+    """测试择优后的 METAR 变化时会覆盖旧数据."""
+    old_winner = {
         "icao": "KJFK",
         "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
         "observed_at": "2026-07-05T04:55:00+00:00",
         "source": "aviationweather.gov",
+        "source_key": "awc",
     }
-    new_data = {
+    new_winner = {
         "icao": "KJFK",
         "raw_text": "SPECI KJFK 050500Z 25012KT 10SM FEW250 24/17 A3010 RMK AO2 T02400170",
         "observed_at": "2026-07-05T05:00:00+00:00",
-        "source": "aviationweather.gov",
+        "source": "weather.gov",
+        "source_key": "weathergov",
     }
 
-    await _store_if_changed(fake_redis, "KJFK", old_data, test_settings)
-    updated = await _store_if_changed(fake_redis, "KJFK", new_data, test_settings)
+    await _store_winner_if_changed(fake_redis, "KJFK", old_winner, test_settings)
+    updated = await _store_winner_if_changed(
+        fake_redis, "KJFK", new_winner, test_settings
+    )
     assert updated is True
 
     from app.database import get_metar
 
     stored = await get_metar(fake_redis, "KJFK")
-    assert stored["raw_text"] == new_data["raw_text"]
+    assert stored["raw_text"] == new_winner["raw_text"]
+    assert stored["source_key"] == "weathergov"
 
 
 @pytest.mark.asyncio
@@ -292,7 +312,119 @@ async def test_fetch_airport_prefers_weathergov_then_awc(
 
 
 @pytest.mark.asyncio
-async def test_collector_loop_survives_network_errors(fake_redis, test_settings, monkeypatch):
+async def test_select_winner_prefers_later_observed_at():
+    """测试择优逻辑选择 observed_at 更晚的记录."""
+    weathergov_record = {
+        "icao": "KSEA",
+        "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:59:15+00:00",
+        "source": "weather.gov",
+        "source_key": "weathergov",
+    }
+    awc_record = {
+        "icao": "KSEA",
+        "raw_text": "METAR KSEA 101100Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+        "observed_at": "2026-07-10T11:00:00+00:00",
+        "updated_at": "2026-07-10T11:05:20+00:00",
+        "source": "aviationweather.gov",
+        "source_key": "awc",
+    }
+
+    winner = _select_winner(weathergov_record, awc_record)
+    assert winner["source_key"] == "awc"
+
+
+@pytest.mark.asyncio
+async def test_select_winner_tie_break_by_latency():
+    """测试 observed_at 相同时，延迟更低的记录胜出."""
+    weathergov_record = {
+        "icao": "KSEA",
+        "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:59:15+00:00",
+        "source": "weather.gov",
+        "source_key": "weathergov",
+    }
+    awc_record = {
+        "icao": "KSEA",
+        "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:55:00+00:00",
+        "source": "aviationweather.gov",
+        "source_key": "awc",
+    }
+
+    winner = _select_winner(weathergov_record, awc_record)
+    assert winner["source_key"] == "awc"
+
+
+@pytest.mark.asyncio
+async def test_select_winner_falls_back_when_one_source_missing():
+    """测试只有一方有数据时直接采用该方."""
+    weathergov_record = {
+        "icao": "KSEA",
+        "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:59:15+00:00",
+        "source": "weather.gov",
+        "source_key": "weathergov",
+    }
+
+    assert _select_winner(weathergov_record, None)["source_key"] == "weathergov"
+    assert _select_winner(None, weathergov_record)["source_key"] == "weathergov"
+    assert _select_winner(None, None) is None
+
+
+@pytest.mark.asyncio
+async def test_merge_and_store_winners_selects_best_source(fake_redis, test_settings):
+    """测试 _merge_and_store_winners 会从两个数据源中选择优胜者写入最终 Key."""
+    from app.database import set_source_metar
+
+    # weather.gov 数据更新鲜
+    weathergov_data = {
+        "icao": "KJFK",
+        "raw_text": "SPECI KJFK 050500Z 25012KT 10SM FEW250 24/17 A3010 RMK AO2 T02400170",
+        "observed_at": "2026-07-05T05:00:00+00:00",
+        "source": "weather.gov",
+        "source_key": "weathergov",
+    }
+    # AWC 数据较旧
+    awc_data = {
+        "icao": "KJFK",
+        "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+        "observed_at": "2026-07-05T04:55:00+00:00",
+        "source": "aviationweather.gov",
+        "source_key": "awc",
+    }
+
+    await set_source_metar(
+        fake_redis,
+        "KJFK",
+        "weathergov",
+        weathergov_data,
+        test_settings.metar_ttl_seconds,
+    )
+    await set_source_metar(
+        fake_redis, "KJFK", "awc", awc_data, test_settings.metar_ttl_seconds
+    )
+
+    # 临时把监控列表设为 KJFK，避免查询其他未初始化的机场
+    test_settings.monitor_airports = "KJFK"
+    await _merge_and_store_winners(fake_redis, test_settings)
+
+    from app.database import get_metar
+
+    winner = await get_metar(fake_redis, "KJFK")
+    assert winner is not None
+    assert winner["source_key"] == "weathergov"
+    assert "SPECI KJFK 050500Z" in winner["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_collector_loop_survives_network_errors(
+    fake_redis, test_settings, monkeypatch
+):
     """测试后台采集循环在网络异常时不会崩溃退出."""
     test_settings.monitor_airports = "KJFK"
     test_settings.poll_interval_seconds = 0.05  # 加速测试
@@ -364,7 +496,9 @@ async def test_fetch_awc_batch_skips_missing_metar_time(fake_redis, test_setting
 
 
 @pytest.mark.asyncio
-async def test_fetch_weathergov_batch_skips_missing_metar_time(fake_redis, test_settings):
+async def test_fetch_weathergov_batch_skips_missing_metar_time(
+    fake_redis, test_settings
+):
     """测试 weather.gov 返回的 rawOb 没有 ddHHMMZ 时间组时跳过该条."""
     bad_response = {
         "STATION": [
@@ -372,7 +506,9 @@ async def test_fetch_weathergov_batch_skips_missing_metar_time(fake_redis, test_
                 "STID": "VHHH",
                 "OBSERVATIONS": {
                     "date_time": ["2026-07-05T04:50:00Z"],
-                    "metar_set_1": ["METAR VHHH 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
+                    "metar_set_1": [
+                        "METAR VHHH 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"
+                    ],
                     "metar_origin_set_1": [1.0],
                 },
             }
@@ -390,7 +526,9 @@ async def test_fetch_weathergov_batch_skips_missing_metar_time(fake_redis, test_
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_uses_raw_ob_time_not_report_time(fake_redis, test_settings, monkeypatch):
+async def test_fetch_awc_batch_uses_raw_ob_time_not_report_time(
+    fake_redis, test_settings, monkeypatch
+):
     """测试 AWC 使用 rawOb 中的 ddHHMMZ 作为 observed_at, 而非 reportTime."""
     from datetime import datetime, timezone
 
@@ -418,7 +556,9 @@ async def test_fetch_awc_batch_uses_raw_ob_time_not_report_time(fake_redis, test
 
 
 @pytest.mark.asyncio
-async def test_fetch_weathergov_batch_uses_raw_ob_time_not_date_time(fake_redis, test_settings, monkeypatch):
+async def test_fetch_weathergov_batch_uses_raw_ob_time_not_date_time(
+    fake_redis, test_settings, monkeypatch
+):
     """测试 weather.gov 使用 rawOb 中的 ddHHMMZ 作为 observed_at, 而非 date_time."""
     from datetime import datetime, timezone
 
@@ -433,7 +573,9 @@ async def test_fetch_weathergov_batch_uses_raw_ob_time_not_date_time(fake_redis,
                 "STID": "VHHH",
                 "OBSERVATIONS": {
                     "date_time": ["2026-07-05T04:55:00Z"],
-                    "metar_set_1": ["METAR VHHH 050430Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"],
+                    "metar_set_1": [
+                        "METAR VHHH 050430Z 09010KT 10SM FEW020 28/26 Q1012 RMK AO2 T02800260"
+                    ],
                     "metar_origin_set_1": [1.0],
                 },
             }

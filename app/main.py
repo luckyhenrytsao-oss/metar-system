@@ -6,13 +6,13 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.collector import close_http_client, start_collector_loop
 from app.config import Settings, get_settings
-from app.database import close_redis, get_metar, get_redis
+from app.database import close_redis, get_metar, get_redis, get_source_metar
 
 # 配置日志
 logging.basicConfig(
@@ -108,6 +108,45 @@ async def get_metar_endpoint(
     )
 
 
+@app.get("/api/v1/metar/sources")
+async def get_metar_sources(
+    icao: str = Query(..., min_length=3, max_length=4, description="ICAO 机场代码"),
+    settings: Settings = Depends(get_settings),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """获取指定机场两个数据源各自的原始 METAR 记录以及当前择优后的最终记录.
+
+    - 若 ICAO 不在监控列表，返回 404
+    - 返回结构:
+        {
+            "icao": "KSEA",
+            "winner": { ... },
+            "weathergov": { ... } | null,
+            "awc": { ... } | null
+        }
+    """
+    icao = icao.upper()
+
+    if icao not in {code.upper() for code in settings.monitor_airports_list}:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ICAO code {icao} is not in the monitored airport list",
+        )
+
+    winner = await get_metar(redis_client, icao)
+    weathergov = await get_source_metar(redis_client, icao, "weathergov")
+    awc = await get_source_metar(redis_client, icao, "awc")
+
+    return JSONResponse(
+        content={
+            "icao": icao,
+            "winner": winner,
+            "weathergov": weathergov,
+            "awc": awc,
+        }
+    )
+
+
 @app.get("/health")
 async def health_check():
     """健康检查接口."""
@@ -116,7 +155,7 @@ async def health_check():
 
 # 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
 import asyncio  # noqa: E402
-import re
+import re  # noqa: E402
 
 
 def parse_temperature(raw_text: str) -> tuple[Optional[float], Optional[float]]:
@@ -194,18 +233,22 @@ async def get_metar_batch(
             missing.append(code)
             continue
 
-        data.append({
-            "icao": code,
-            "temperature_c": temp,
-            "dewpoint_c": dewpoint,
-            "raw_text": metar["raw_text"],
-            "observed_at": metar.get("observed_at"),
-            "updated_at": metar.get("updated_at"),
-            "source": metar.get("source"),
-        })
+        data.append(
+            {
+                "icao": code,
+                "temperature_c": temp,
+                "dewpoint_c": dewpoint,
+                "raw_text": metar["raw_text"],
+                "observed_at": metar.get("observed_at"),
+                "updated_at": metar.get("updated_at"),
+                "source": metar.get("source"),
+            }
+        )
 
-    return JSONResponse(content={
-        "data": data,
-        "missing": missing,
-        "count": len(data),
-    })
+    return JSONResponse(
+        content={
+            "data": data,
+            "missing": missing,
+            "count": len(data),
+        }
+    )

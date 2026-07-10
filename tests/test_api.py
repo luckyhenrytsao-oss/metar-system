@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from app.database import set_metar
 
@@ -142,14 +141,21 @@ class TestBatchMetarEndpoint:
         """未监控和无数据的机场进入 missing 列表."""
         import asyncio
 
-        asyncio.run(set_metar(fake_redis, "KJFK", {
-            "icao": "KJFK",
-            "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
-            "observed_at": "2026-07-05T04:55:00+00:00",
-            "updated_at": "2026-07-05T04:55:00+00:00",
-            "hash": "abc123def456",
-            "source": "aviationweather.gov",
-        }, 7200))
+        asyncio.run(
+            set_metar(
+                fake_redis,
+                "KJFK",
+                {
+                    "icao": "KJFK",
+                    "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+                    "observed_at": "2026-07-05T04:55:00+00:00",
+                    "updated_at": "2026-07-05T04:55:00+00:00",
+                    "hash": "abc123def456",
+                    "source": "aviationweather.gov",
+                },
+                7200,
+            )
+        )
 
         response = test_client.post(
             "/api/v1/metar/batch",
