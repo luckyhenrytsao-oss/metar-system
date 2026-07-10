@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 
     # 轮询间隔，规范要求 1~2 秒
     poll_interval_seconds: float = Field(
-        default=1.5,
+        default=1.0,
         ge=1.0,
         le=2.0,
         description="采集器轮询间隔（秒），范围 1.0~2.0",
