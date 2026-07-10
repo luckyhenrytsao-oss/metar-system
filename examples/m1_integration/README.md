@@ -68,6 +68,16 @@ for r in records:
     print(r["icao"], r["temperature_c"], r["dewpoint_c"])
 ```
 
+## 数据源说明
+
+M2 当前从两个数据源独立采集并择优：
+
+- **weather.gov / SynopticData**：`metar:{icao}:source:weathergov`
+- **AviationWeather.gov (AWC)**：`metar:{icao}:source:awc`
+
+最终返回给外部项目的 `source` 字段表示该机场当前被采纳的数据源。
+`GET /api/v1/metar/sources?icao={icao}` 可查看两个数据源的原始记录。
+
 ## 注意事项
 
 - 目标项目应把这个客户端按自己的目录结构、日志、配置管理方式重写，
