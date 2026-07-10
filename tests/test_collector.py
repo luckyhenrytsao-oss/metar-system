@@ -159,21 +159,17 @@ async def test_fetch_weathergov_filters_non_metar_origin(
 
 
 @pytest.mark.asyncio
-async def test_fetch_weathergov_skips_speci(
-    fake_redis, test_settings, sample_weathergov_speci_response
-):
-    """测试 weather.gov 采集器跳过 SPECI，只保留整点 METAR."""
-    test_settings.weathergov_token = "fake-token-for-test"
-
+async def test_fetch_awc_disabled_for_uuww(fake_redis, test_settings):
+    """测试 UUWW 不请求 AviationWeather.gov."""
     with respx.mock:
-        respx.get("https://api.synopticdata.com/v2/stations/timeseries").mock(
-            return_value=Response(200, json=sample_weathergov_speci_response)
+        # 这个路由不应该被调用
+        route = respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=[])
         )
-        results = await _fetch_weathergov_batch(["KSEA"], test_settings)
+        result = await _fetch_awc_single("UUWW", test_settings)
 
-    assert "KSEA" in results
-    assert "SPECI" not in results["KSEA"]["raw_text"]
-    assert "051400Z" in results["KSEA"]["raw_text"]
+    assert result is None
+    assert not route.called
 
 
 @pytest.mark.asyncio

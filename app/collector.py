@@ -163,8 +163,8 @@ def _extract_weathergov_metars(
         if not times or not metars:
             continue
 
-        # 从后往前扫描，取最新一条真正 METAR（跳过 SPECI）；
-        # 优先选择含 RMK+T 精确温度组的，没有则保留普通 METAR。
+        # 从后往前扫描，取最新一条真正 METAR/SPECI；
+        # 优先选择含 RMK+T 精确温度组的，没有则保留普通 METAR/SPECI。
         selected_idx: Optional[int] = None
         fallback_idx: Optional[int] = None
         for idx in range(len(times) - 1, -1, -1):
@@ -178,12 +178,8 @@ def _extract_weathergov_metars(
             if not raw_metar:
                 continue
 
-            # 跳过 SPECI 报文，只保留整点 METAR
-            if raw_metar.startswith("SPECI "):
-                continue
-
             if _has_precision_temp(raw_metar):
-                # 找到带精确温度组的 METAR，立即采用
+                # 找到带精确温度组的，立即采用
                 selected_idx = idx
                 break
 
@@ -276,6 +272,10 @@ def _has_precision_temp(raw_text: str) -> bool:
     return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}\b", raw_text))
 
 
+# 禁用 AviationWeather.gov 的机场列表（某些机场 AWC 数据质量不佳或不可用）
+AWC_DISABLED_AIRPORTS = {"UUWW"}
+
+
 async def _fetch_awc_single(
     code: str,
     settings: Optional[Settings] = None,
@@ -285,11 +285,16 @@ async def _fetch_awc_single(
     只接收 METAR/SPECI 报文；AUTO 报直接跳过。
     优先选择含 RMK+T 精确温度组的报文，没有则保留普通 METAR/SPECI。
     """
+    code = code.upper()
+    if code in AWC_DISABLED_AIRPORTS:
+        logger.debug("AviationWeather disabled for %s, skipping", code)
+        return None
+
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
 
     params = {
-        "ids": code.upper(),
+        "ids": code,
         "format": "json",
         "hours": "1",
     }
