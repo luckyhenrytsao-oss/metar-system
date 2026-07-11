@@ -6,11 +6,50 @@
 ## 接口地址
 
 ```text
+GET http://47.251.25.183/api/v1/metar/sources?icao={icao}
+GET http://47.251.25.183/api/v1/metar/sources/history?icao={icao}&hours={N}
 POST http://47.251.25.183/api/v1/metar/batch
 Content-Type: application/json
 ```
 
-## 请求体
+## 双源最新记录
+
+`GET /api/v1/metar/sources?icao={icao}` 返回当前两个数据源的最新记录及择优后的 winner：
+
+```json
+{
+  "icao": "KSEA",
+  "winner": { ... },
+  "weathergov": { ... },
+  "awc": { ... }
+}
+```
+
+## 双源历史记录
+
+`GET /api/v1/metar/sources/history?icao={icao}&hours=24` 返回过去 24 小时内该机场每条 METAR
+在两个数据源中的发现时间、原始报文、温度及 winner。适用于 Dashboard 按时间窗口回溯分析。
+
+响应结构与 `/api/v1/metar/sources` 一致，但 `records` 为数组，按 `observed_at` 降序返回：
+
+```json
+{
+  "icao": "KORD",
+  "count": 3,
+  "records": [
+    {
+      "observed_at": "2026-07-11T01:51:00+00:00",
+      "winner": { "source_key": "awc", ... },
+      "awc": { ... },
+      "weathergov": { ... }
+    }
+  ]
+}
+```
+
+## 批量温度接口
+
+### 请求体
 
 ```json
 {
@@ -77,6 +116,7 @@ M2 当前从两个数据源独立采集并择优：
 
 最终返回给外部项目的 `source` 字段表示该机场当前被采纳的数据源。
 `GET /api/v1/metar/sources?icao={icao}` 可查看两个数据源的原始记录。
+`GET /api/v1/metar/sources/history?icao={icao}&hours={N}` 可查看历史窗口内的多条记录对比。
 
 ## 注意事项
 

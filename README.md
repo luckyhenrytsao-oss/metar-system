@@ -79,7 +79,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 接口：
 
 - `GET /api/v1/metar?icao={ICAO_CODE}` —— 获取择优后的最终 METAR
-- `GET /api/v1/metar/sources?icao={ICAO_CODE}` —— 查看 weathergov / awc 双源记录及 winner
+- `GET /api/v1/metar/sources?icao={ICAO_CODE}` —— 获取两个数据源的最新原始记录及当前 winner
+- `GET /api/v1/metar/sources/history?icao={ICAO_CODE}&hours={N}` —— 按时间窗口查询历史双源对比（支持 `start`/`end`）
 - `POST /api/v1/metar/batch` —— 批量获取温度解析结果
 - `GET /health` —— 健康检查
 
@@ -89,6 +90,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 curl -i "http://127.0.0.1:8000/api/v1/metar?icao=KJFK"
 curl -i "http://127.0.0.1:8000/api/v1/metar?icao=KJFK" -H 'If-None-Match: "hashvalue"'
 curl -i "http://127.0.0.1:8000/api/v1/metar/sources?icao=KSEA"
+curl -i "http://127.0.0.1:8000/api/v1/metar/sources/history?icao=KSEA&hours=24"
+curl -i "http://127.0.0.1:8000/api/v1/metar/sources/history?icao=KSEA&start=2026-07-10T00:00:00Z&end=2026-07-11T00:00:00Z"
 ```
 
 ## Docker 本地运行
@@ -184,8 +187,11 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 | `metar:{icao}` | String (JSON) | 择优后的最终 METAR 记录，API 返回此记录 |
 | `metar:{icao}:source:weathergov` | String (JSON) | weather.gov / SynopticData 最新原始记录 |
 | `metar:{icao}:source:awc` | String (JSON) | AviationWeather.gov 最新原始记录 |
+| `history:metar:{icao}:source:weathergov` | Sorted Set (JSON) | weather.gov 历史记录，score 为 observed_at 时间戳 |
+| `history:metar:{icao}:source:awc` | Sorted Set (JSON) | AWC 历史记录，score 为 observed_at 时间戳 |
 
 所有 Key 强制 TTL = `METAR_TTL_SECONDS`（默认 7200 秒），防止采集器崩溃时客户端读到陈旧数据。
+历史 Sorted Set 默认保留 7 天，并自动清理过期数据。
 
 ## 采集与择优逻辑
 
@@ -196,13 +202,44 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
    - AWC：请求全部监控机场，但跳过 `AWC_DISABLED_AIRPORTS = {"UUWW"}`
 2. **分别写入 source-specific Key**
    - 仅当该数据源的 METAR 文本 hash 变化时才写入，避免无意义刷新
-3. **逐机场择优**
+3. **追加到历史记录**
+   - 每次 source-specific Key 更新时，同时写入 `history:metar:{icao}:source:{source}` Sorted Set
+   - 以 `observed_at` 时间戳作为 score，便于按时间窗口查询
+   - 自动清理超过 7 天的旧记录
+4. **逐机场择优**
    - 比较 `metar:{icao}:source:weathergov` 与 `metar:{icao}:source:awc`
    - 优先选择 `observed_at` 更晚的记录（更新鲜）
    - 若 `observed_at` 相同，选择延迟 `updated_at - observed_at` 更小的记录
    - 若仍相同，默认选择 weather.gov
-4. **写入最终 Key**
+5. **写入最终 Key**
    - 若择优结果 hash 变化，覆盖 `metar:{icao}`
+
+## 历史接口
+
+`GET /api/v1/metar/sources/history?icao={ICAO}&hours={N}`
+
+返回指定机场过去 N 小时内每条 METAR 在两个数据源中的发现时间及 winner：
+
+```json
+{
+  "icao": "KORD",
+  "count": 3,
+  "records": [
+    {
+      "observed_at": "2026-07-11T01:51:00+00:00",
+      "winner": { "source_key": "awc", "updated_at": "...", "raw_text": "...", "temperature_c": 23.3 },
+      "awc": { ... },
+      "weathergov": { ... }
+    }
+  ]
+}
+```
+
+也支持 `start`/`end` 参数：
+
+```text
+GET /api/v1/metar/sources/history?icao=KORD&start=2026-07-10T00:00:00Z&end=2026-07-11T00:00:00Z
+```
 
 ## 数据源说明
 

@@ -495,9 +495,11 @@ async def _store_source_if_changed(
         "source_key": source,
     }
 
-    from app.database import set_source_metar
+    from app.database import add_source_history, set_source_metar
 
     await set_source_metar(redis_client, icao, source, payload, cfg.metar_ttl_seconds)
+    # 同时追加到历史记录，用于 Dashboard 按时间窗口回溯
+    await add_source_history(redis_client, icao, source, payload)
     logger.info(
         "Source METAR updated for %s/%s (hash=%s... source=%s)",
         icao,

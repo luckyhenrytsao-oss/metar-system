@@ -12,7 +12,14 @@ from pydantic import BaseModel
 
 from app.collector import close_http_client, start_collector_loop
 from app.config import Settings, get_settings
-from app.database import close_redis, get_metar, get_redis, get_source_metar
+from app.database import (
+    close_redis,
+    get_metar,
+    get_redis,
+    get_source_history,
+    get_source_metar,
+    parse_iso,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -147,6 +154,143 @@ async def get_metar_sources(
     )
 
 
+@app.get("/api/v1/metar/sources/history")
+async def get_metar_sources_history(
+    icao: str = Query(..., min_length=3, max_length=4, description="ICAO 机场代码"),
+    hours: Optional[int] = Query(None, ge=1, le=168, description="过去多少小时（1~168），与 start/end 二选一"),
+    start: Optional[str] = Query(None, description="ISO 8601 起始时间，UTC，与 hours 二选一"),
+    end: Optional[str] = Query(None, description="ISO 8601 结束时间，UTC，默认当前时间"),
+    settings: Settings = Depends(get_settings),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """获取指定机场在一段时间内多条 METAR 的双源速度对比历史.
+
+    支持两种参数组合：
+      - icao + hours：查询过去 hours 小时
+      - icao + start + [end]：查询指定时间窗口
+
+    返回按 observed_at 降序排列的记录数组，每条记录包含该 METAR
+    在 AWC 与 weather.gov 中的发现时间及当前 M2 采用的 winner。
+    """
+    icao = icao.upper()
+
+    if icao not in {code.upper() for code in settings.monitor_airports_list}:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ICAO code {icao} is not in the monitored airport list",
+        )
+
+    # 解析时间窗口
+    now = datetime.now(timezone.utc)
+    if hours is not None:
+        if start is not None or end is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="hours 与 start/end 不能同时使用",
+            )
+        start_dt = now - timedelta(hours=hours)
+        end_dt = now
+    else:
+        if start is None:
+            raise HTTPException(
+                status_code=422,
+                detail="必须提供 hours 或 start 参数",
+            )
+        start_dt = parse_iso(start)
+        if start_dt is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"无法解析 start 时间: {start}",
+            )
+        end_dt = parse_iso(end) if end else now
+        if end_dt is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"无法解析 end 时间: {end}",
+            )
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=422,
+            detail="end 必须晚于 start",
+        )
+
+    # 读取两个数据源的历史记录
+    weathergov_records = await get_source_history(redis_client, icao, "weathergov", start_dt, end_dt)
+    awc_records = await get_source_history(redis_client, icao, "awc", start_dt, end_dt)
+
+    # 合并：按 observed_at 分组
+    grouped: dict[str, dict[str, Any]] = {}
+
+    def _group_record(record: dict[str, Any], source_key: str) -> None:
+        obs = record.get("observed_at")
+        if not obs:
+            return
+        item = grouped.setdefault(
+            obs,
+            {
+                "observed_at": obs,
+                "weathergov": None,
+                "awc": None,
+            },
+        )
+        # 补充 temperature_c
+        record_out = dict(record)
+        record_out["temperature_c"], record_out["dewpoint_c"] = parse_temperature(record_out.get("raw_text", ""))
+        item[source_key] = record_out
+
+    for r in weathergov_records:
+        _group_record(r, "weathergov")
+    for r in awc_records:
+        _group_record(r, "awc")
+
+    # 为每个 observed_at 计算 winner
+    records: list[dict[str, Any]] = []
+    for obs, item in grouped.items():
+        winner = _select_history_winner(item["weathergov"], item["awc"])
+        item["winner"] = winner
+        records.append(item)
+
+    # 按 observed_at 降序
+    records.sort(key=lambda x: x["observed_at"], reverse=True)
+
+    return JSONResponse(
+        content={
+            "icao": icao,
+            "count": len(records),
+            "records": records,
+        }
+    )
+
+
+def _select_history_winner(
+    weathergov_record: Optional[dict[str, Any]],
+    awc_record: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """从历史记录的两个数据源条目中选出优胜者.
+
+    规则与采集器一致：observed_at 更晚优先；相同时延迟更低优先；
+    还相同则默认 weather.gov。history 接口中同一 observed_at 分组内
+    observed_at 必然相同，因此实际比较延迟。
+    """
+    if weathergov_record is None:
+        return awc_record
+    if awc_record is None:
+        return weathergov_record
+
+    wg_updated = parse_iso(weathergov_record.get("updated_at"))
+    awc_updated = parse_iso(awc_record.get("updated_at"))
+
+    if wg_updated is None:
+        return awc_record
+    if awc_updated is None:
+        return weathergov_record
+
+    if awc_updated < wg_updated:
+        return awc_record
+    return weathergov_record
+
+
 @app.get("/health")
 async def health_check():
     """健康检查接口."""
@@ -156,6 +300,7 @@ async def health_check():
 # 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
 import asyncio  # noqa: E402
 import re  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 
 
 def parse_temperature(raw_text: str) -> tuple[Optional[float], Optional[float]]:
