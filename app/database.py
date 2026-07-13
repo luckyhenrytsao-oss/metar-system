@@ -179,7 +179,7 @@ async def add_source_history(
         return
 
     if obs_dt is None:
-        return
+        return False
 
     score = _dt_to_score(obs_dt)
     key = _history_key(icao, source)
@@ -201,15 +201,164 @@ async def add_source_history(
 
     member = json.dumps(history_record, ensure_ascii=False, sort_keys=True)
 
+    # 检查同 observed_at 是否已有不同 hash 的记录（用于官方修正检测）
+    existing_members = await redis_client.zrangebyscore(key, score, score, withscores=False)
+    existing_hashes = {
+        _parse_history_member(m).get("hash")
+        for m in existing_members
+        if _parse_history_member(m) is not None
+    }
+    is_new_hash = record_hash not in existing_hashes
+
     pipe = redis_client.pipeline()
-    # 添加或更新该 hash 对应的历史记录（score 以 observed_at 为准）
-    pipe.zadd(key, {member: score}, nx=False, gt=False)
+    if is_new_hash:
+        # 新 hash：直接追加
+        pipe.zadd(key, {member: score})
+    else:
+        # 已存在则更新 member（让 updated_at 保持最新，用于延迟分析）
+        pipe.zremrangebyscore(key, score, score)
+        pipe.zadd(key, {member: score})
     # 清理超过 retention 的旧记录
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     pipe.zremrangebyscore(key, "-inf", _dt_to_score(cutoff))
-    # 给整个 key 设置 TTL，防止机场从监控列表移除后残留
+    # 给整个 key 设置 TTL，防止冷机场从监控列表移除后残留
     pipe.expire(key, (retention_days + 1) * 86400)
     await pipe.execute()
+
+    return is_new_hash
+
+
+def _correction_event_key(icao: str, source: str, observed_at: datetime) -> str:
+    """生成官方修正事件的 Hash Key."""
+    ts = int(_dt_to_score(observed_at))
+    return f"events:metar:correction:{icao.upper()}:{source}:{ts}"
+
+
+async def record_correction_event(
+    redis_client: redis.Redis,
+    icao: str,
+    source: str,
+    observed_at: datetime,
+    first_record: dict[str, Any],
+    corrected_record: dict[str, Any],
+    retention_days: int = 360,
+) -> None:
+    """记录一次 METAR 官方修正事件.
+
+    触发条件：同一个数据源、同一个机场、同一个 observed_at，
+    后续收到了与之前不同 hash 的官方 METAR/SPECI 报文。
+
+    每次新的修正都会生成一条独立的 event 记录，保留完整原始报文。
+    """
+    icao = icao.upper()
+    detected_at = datetime.now(timezone.utc)
+
+    first_updated = parse_iso(first_record.get("updated_at")) or detected_at
+    corrected_updated = parse_iso(corrected_record.get("updated_at")) or detected_at
+    correction_delay = (corrected_updated - first_updated).total_seconds()
+
+    event = {
+        "icao": icao,
+        "source": first_record.get("source", "unknown"),
+        "source_key": source,
+        "observed_at": observed_at.isoformat(),
+        "first_updated_at": first_updated.isoformat(),
+        "first_hash": first_record.get("hash", ""),
+        "first_raw_text": first_record.get("raw_text", ""),
+        "corrected_updated_at": corrected_updated.isoformat(),
+        "corrected_hash": corrected_record.get("hash", ""),
+        "corrected_raw_text": corrected_record.get("raw_text", ""),
+        "detected_at": detected_at.isoformat(),
+        "correction_delay_seconds": correction_delay,
+    }
+
+    event_key = _correction_event_key(icao, source, observed_at)
+    index_key = "events:metar:correction:index"
+
+    # 为同一个 observed_at 的多次修正生成唯一 member：追加 corrected_hash
+    index_member = f"{event_key}:{corrected_record.get('hash', '')}"
+
+    pipe = redis_client.pipeline()
+    # 用 List 追加同一 observed_at 下的所有修正事件，保留完整历史
+    pipe.rpush(event_key, json.dumps(event, ensure_ascii=False, sort_keys=True))
+    pipe.expire(event_key, retention_days * 86400)
+    # 全局时间索引
+    pipe.zadd(index_key, {index_member: _dt_to_score(detected_at)})
+    pipe.expire(index_key, retention_days * 86400)
+    await pipe.execute()
+
+    logger.warning(
+        "METAR correction event detected: %s/%s at %s delay=%.1fs "
+        "first_hash=%s corrected_hash=%s",
+        icao,
+        source,
+        observed_at.isoformat(),
+        correction_delay,
+        first_record.get("hash", "")[:8],
+        corrected_record.get("hash", "")[:8],
+    )
+
+
+async def get_correction_events(
+    redis_client: redis.Redis,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    icao: Optional[str] = None,
+    source: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """查询 METAR 官方修正事件.
+
+    支持按时间窗口、机场、数据源过滤。返回按 detected_at 降序排列的事件列表。
+    """
+    index_key = "events:metar:correction:index"
+    min_score = _dt_to_score(start_dt) if start_dt else "-inf"
+    max_score = _dt_to_score(end_dt) if end_dt else "+inf"
+
+    members = await redis_client.zrevrangebyscore(
+        index_key, max_score, min_score, start=0, num=limit * 2
+    )
+
+    prefix_filter = None
+    if icao and source:
+        prefix_filter = f"events:metar:correction:{icao.upper()}:{source}:"
+    elif icao:
+        prefix_filter = f"events:metar:correction:{icao.upper()}:"
+
+    events: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    for member in members:
+        # member 格式: events:metar:correction:{icao}:{source}:{ts}:{hash}
+        parts = member.rsplit(":", 1)
+        event_key = parts[0]
+
+        if prefix_filter and not event_key.startswith(prefix_filter):
+            continue
+        if event_key in seen_keys:
+            continue
+        seen_keys.add(event_key)
+
+        raw_events = await redis_client.lrange(event_key, 0, -1)
+        for raw in raw_events:
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("Corrupted correction event: %s", raw[:80])
+                continue
+            # 二次过滤
+            if icao and event.get("icao", "").upper() != icao.upper():
+                continue
+            if source and event.get("source_key", "") != source:
+                continue
+            events.append(event)
+
+        if len(events) >= limit:
+            break
+
+    # 按 detected_at 降序，截断到 limit
+    events.sort(key=lambda x: x.get("detected_at", ""), reverse=True)
+    return events[:limit]
 
 
 async def get_source_history(

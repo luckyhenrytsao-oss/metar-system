@@ -14,6 +14,7 @@ from app.collector import close_http_client, start_collector_loop
 from app.config import Settings, get_settings
 from app.database import (
     close_redis,
+    get_correction_events,
     get_metar,
     get_redis,
     get_source_history,
@@ -289,6 +290,79 @@ def _select_history_winner(
     if awc_updated < wg_updated:
         return awc_record
     return weathergov_record
+
+
+@app.get("/api/v1/metar/corrections")
+async def get_metar_corrections(
+    hours: Optional[int] = Query(None, ge=1, le=720, description="过去多少小时（1~720，默认24），与 start/end 二选一"),
+    start: Optional[str] = Query(None, description="ISO 8601 起始时间，UTC，与 hours 二选一"),
+    end: Optional[str] = Query(None, description="ISO 8601 结束时间，UTC，默认当前时间"),
+    icao: Optional[str] = Query(None, min_length=3, max_length=4, description="可选：按机场过滤"),
+    source: Optional[str] = Query(None, description="可选：按数据源过滤，weathergov 或 awc"),
+    limit: int = Query(100, ge=1, le=1000, description="最多返回条数"),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """查询 METAR 官方修正事件.
+
+    触发条件：同一个数据源、同一个机场、同一个 observed_at，
+    后续收到了与之前不同 hash 的官方 METAR/SPECI 报文。
+
+    支持参数：
+      - hours / start / end：时间窗口
+      - icao：按机场过滤
+      - source：按数据源过滤（weathergov / awc）
+      - limit：最多返回条数
+    """
+    # 解析时间窗口
+    now = datetime.now(timezone.utc)
+    if hours is not None:
+        if start is not None or end is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="hours 与 start/end 不能同时使用",
+            )
+        start_dt = now - timedelta(hours=hours)
+        end_dt = now
+    else:
+        if start is None:
+            start_dt = now - timedelta(hours=24)
+        else:
+            start_dt = parse_iso(start)
+            if start_dt is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"无法解析 start 时间: {start}",
+                )
+        end_dt = parse_iso(end) if end else now
+        if end_dt is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"无法解析 end 时间: {end}",
+            )
+
+    if end_dt < start_dt:
+        raise HTTPException(
+            status_code=422,
+            detail="end 必须晚于 start",
+        )
+
+    events = await get_correction_events(
+        redis_client,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        icao=icao.upper() if icao else None,
+        source=source,
+        limit=limit,
+    )
+
+    return JSONResponse(
+        content={
+            "count": len(events),
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "events": events,
+        }
+    )
 
 
 @app.get("/health")

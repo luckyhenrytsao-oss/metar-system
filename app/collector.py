@@ -472,13 +472,24 @@ async def _store_source_if_changed(
     metar_data: dict[str, Any],
     settings: Optional[Settings] = None,
 ) -> bool:
-    """如果某个数据源的 METAR 文本有变化，则写入该数据源专属 Key 并返回 True."""
+    """如果某个数据源的 METAR 文本有变化，则写入该数据源专属 Key 并返回 True.
+
+    同时检测是否存在同一 observed_at 的官方 METAR 修正事件：
+    如果同数据源同机场同一 METAR 时间，后续出现了不同 hash 的报文，
+    则记录为一次 correction event。
+    """
     cfg = settings or get_settings()
     icao = icao.upper()
     raw_text = metar_data["raw_text"]
     new_hash = _compute_hash(raw_text)
 
-    from app.database import get_existing_source_hash
+    from app.database import (
+        add_source_history,
+        get_existing_source_hash,
+        get_source_history,
+        record_correction_event,
+        set_source_metar,
+    )
 
     existing_hash = await get_existing_source_hash(redis_client, icao, source)
     if existing_hash == new_hash:
@@ -495,11 +506,35 @@ async def _store_source_if_changed(
         "source_key": source,
     }
 
-    from app.database import add_source_history, set_source_metar
-
     await set_source_metar(redis_client, icao, source, payload, cfg.metar_ttl_seconds)
     # 同时追加到历史记录，用于 Dashboard 按时间窗口回溯
-    await add_source_history(redis_client, icao, source, payload)
+    is_new_history = await add_source_history(redis_client, icao, source, payload)
+
+    # 官方修正事件检测：同一 observed_at 出现了新的 hash
+    if is_new_history:
+        obs_dt = _parse_observed_at(payload["observed_at"])
+        if obs_dt is not None:
+            prior_records = await get_source_history(
+                redis_client, icao, source, obs_dt, obs_dt
+            )
+            # 排除当前这条自己，取同一 observed_at 下的其他 hash
+            prior_different = [
+                r
+                for r in prior_records
+                if r.get("hash") != new_hash
+            ]
+            if prior_different:
+                # 按 updated_at 排序，取最早出现的那条作为 first_record
+                prior_different.sort(key=lambda r: r.get("updated_at") or "")
+                await record_correction_event(
+                    redis_client,
+                    icao,
+                    source,
+                    obs_dt,
+                    first_record=prior_different[0],
+                    corrected_record=payload,
+                )
+
     logger.info(
         "Source METAR updated for %s/%s (hash=%s... source=%s)",
         icao,
