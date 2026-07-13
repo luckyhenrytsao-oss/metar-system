@@ -1,5 +1,7 @@
 name: Build, Test and Deploy METAR System
 
+# Trigger: push to main, PR to main, or manual dispatch.
+# NOTE: This workflow is intentionally kept simple to reduce approval prompts.
 on:
   push:
     branches: [main]
