@@ -10,3 +10,5 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+# 本地生成的临时 Excel 报告
+*.xlsx
