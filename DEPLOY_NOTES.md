@@ -16,7 +16,10 @@
 - [x] 本地代码已 push 到 `main`
 - [x] GitHub Actions Secrets 已配置（`GHCR_TOKEN`、`VPS_HOST`、`VPS_PORT`、`VPS_USER`、`VPS_SSH_KEY`）
 - [x] VPS 首次手动部署已完成
-- [x] Nginx 反向代理已配置：公网 80 → `127.0.0.1:8000`
+- [x] Nginx 反向代理已配置：
+  - 公网 80 → `127.0.0.1:8000`（M2 API `/api/v1/*` 与 `/health`）
+  - 公网 443 → `127.0.0.1:8080`（dabolo.org Dashboard）
+  - 未匹配域名的 80 请求由 M2 默认 server 处理，保留 IP 直接访问
 - [x] GitHub Actions 自动部署已成功跑通多次
 
 ## GitHub Secrets 配置
@@ -68,6 +71,8 @@ curl http://127.0.0.1:8000/health
 | 2026-07-10 | 将 `POLL_INTERVAL_SECONDS` 默认调整为 `1.0` | `2d6ef95` |
 | 2026-07-10 | `observed_at` 统一从 `rawOb` 的 `ddHHMMZ` 解析 | `01fea9e` |
 | 2026-07-10 | 双源独立采集 + source-specific Key + 择优合并 | `23b8e85` |
+| 2026-07-13 | 新增 METAR 官方修正事件检测与 `/api/v1/metar/corrections` 接口 | `9608d59` |
+| 2026-07-14 | 修复 Nginx 配置：80 端口保留 IP 访问 M2 API，443 端口托管 dabolo.org Dashboard | - |
 
 ## 可选但推荐
 
