@@ -287,8 +287,25 @@ def _has_precision_temp(raw_text: str) -> bool:
     return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}\b", raw_text))
 
 
-# 禁用 AviationWeather.gov 的机场列表（某些机场 AWC 数据质量不佳或不可用）
-AWC_DISABLED_AIRPORTS = {"UUWW"}
+# 对以下机场，AWC 的 SPECI 报文需要跳过。
+# 原因：这些机场的 weather.gov 结算源存在"整点抽样原则"，会跳过 SPECI 报告。
+# 若 M2 采集了 AWC 的 SPECI，会与结算口径不一致。
+AWC_SPECI_FILTER_STATIONS = {"UUWW", "LTFM", "LLBG"}
+
+
+def _is_awc_speci_filtered(icao: str, raw_metar: str, metar_type: str) -> bool:
+    """判断某条 AWC 记录是否需要因 SPECI 过滤而跳过.
+
+    规则：对 AWC_SPECI_FILTER_STATIONS 中的机场，如果 rawOb 或 metarType 表明是 SPECI，则跳过。
+    """
+    if icao.upper() not in AWC_SPECI_FILTER_STATIONS:
+        return False
+    if metar_type == "SPECI":
+        return True
+    # 部分 AWC 记录 metarType 字段可能为空，但从 rawOb 中以 SPECI 开头可判断
+    if raw_metar and raw_metar.upper().startswith("SPECI "):
+        return True
+    return False
 
 
 async def _fetch_awc_batch(
@@ -297,15 +314,14 @@ async def _fetch_awc_batch(
 ) -> dict[str, dict[str, Any]]:
     """从 AviationWeather.gov 批量获取多个机场的 METAR.
 
-    只接收 METAR/SPECI 报文；AUTO 报直接跳过。
-    优先选择含 RMK+T 精确温度组的报文，没有则保留普通 METAR/SPECI。
+    - 接收 METAR / SPECI / AUTO 报文（AUTO 视为有效 METAR，与 T0TX 口径一致）。
+    - 对 AWC_SPECI_FILTER_STATIONS 中的机场，跳过 AWC 来源的 SPECI 报文。
+    - 同一机场返回多条记录时，优先保留含 RMK+T 精确温度组的报文。
     """
     cfg = settings or get_settings()
     client = _get_http_client(cfg)
 
-    requested_codes = {
-        code.upper() for code in codes if code.upper() not in AWC_DISABLED_AIRPORTS
-    }
+    requested_codes = {code.upper() for code in codes}
     if not requested_codes:
         return {}
 
@@ -337,7 +353,13 @@ async def _fetch_awc_batch(
                 continue
 
             metar_type = item.get("metarType", "")
-            if metar_type not in {"METAR", "SPECI"}:
+            # 跳过非 METAR/SPECI/AUTO 类型（如 NIL、TEST 等异常报）
+            if metar_type and metar_type not in {"METAR", "SPECI", "AUTO"}:
+                continue
+
+            # 对特定机场过滤 AWC SPECI，避免与 weather.gov 结算口径不一致
+            if _is_awc_speci_filtered(icao, raw_metar, metar_type):
+                logger.debug("Skipping AWC SPECI for %s: %s", icao, raw_metar[:60])
                 continue
 
             # 同一机场可能返回多条记录，优先保留带 RMK+T 的

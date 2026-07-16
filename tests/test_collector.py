@@ -51,11 +51,11 @@ def sample_awc_response():
 
 @pytest.fixture
 def sample_awc_response_with_auto():
-    """AWC API 返回 AUTO 与 METAR；应过滤 AUTO."""
+    """AWC API 返回 AUTO 与 METAR；AUTO 应被视为有效报文保留."""
     return [
         {
             "icaoId": "KJFK",
-            "rawOb": "METAR KJFK 050455Z AUTO 24008KT 10SM FEW250 25/18 A3012",
+            "rawOb": "METAR KJFK 050455Z AUTO 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
             "reportTime": "2026-07-05T04:55:00Z",
             "metarType": "AUTO",
         },
@@ -128,10 +128,14 @@ async def test_fetch_awc_batch_success(fake_redis, test_settings, sample_awc_res
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_filters_auto(
-    fake_redis, test_settings, sample_awc_response_with_auto
+async def test_fetch_awc_batch_keeps_auto(
+    fake_redis, test_settings, sample_awc_response_with_auto, monkeypatch
 ):
-    """测试 AWC 批量请求过滤 AUTO 报文."""
+    """测试 AWC 批量请求保留 AUTO 报文，与 T0TX 口径一致."""
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+    )
     with respx.mock:
         respx.get("https://aviationweather.gov/api/data/metar").mock(
             return_value=Response(200, json=sample_awc_response_with_auto)
@@ -139,22 +143,62 @@ async def test_fetch_awc_batch_filters_auto(
         results = await _fetch_awc_batch(["KJFK"], test_settings)
 
     assert "KJFK" in results
-    assert "AUTO" not in results["KJFK"]["raw_text"]
-    assert "T02500180" in results["KJFK"]["raw_text"]
+    # AUTO 报文更新且被保留
+    assert "AUTO" in results["KJFK"]["raw_text"]
+    assert results["KJFK"]["observed_at"] == "2026-07-05T04:55:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_fetch_awc_batch_filters_speci_for_selected_stations(fake_redis, test_settings):
+    """测试 UUWW / LTFM / LLBG 在 AWC 中跳过 SPECI，其他机场正常保留."""
+    response = [
+        {
+            "icaoId": "UUWW",
+            "rawOb": "SPECI UUWW 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "SPECI",
+        },
+        {
+            "icaoId": "UUWW",
+            "rawOb": "METAR UUWW 050430Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:30:00Z",
+            "metarType": "METAR",
+        },
+        {
+            "icaoId": "KJFK",
+            "rawOb": "SPECI KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180",
+            "reportTime": "2026-07-05T04:55:00Z",
+            "metarType": "SPECI",
+        },
+    ]
+    with respx.mock:
+        respx.get("https://aviationweather.gov/api/data/metar").mock(
+            return_value=Response(200, json=response)
+        )
+        results = await _fetch_awc_batch(["UUWW", "KJFK"], test_settings)
+
+    # UUWW 的 SPECI 被过滤，但同一机场的 METAR 仍被保留
+    assert "UUWW" in results
+    assert "SPECI" not in results["UUWW"]["raw_text"]
+    assert results["UUWW"]["raw_text"].startswith("METAR UUWW")
+
+    # KJFK 不在过滤列表，SPECI 正常保留
+    assert "KJFK" in results
+    assert "SPECI" in results["KJFK"]["raw_text"]
 
 
 @pytest.mark.asyncio
 async def test_fetch_awc_batch_disabled_for_uuww(fake_redis, test_settings):
-    """测试 UUWW 不请求 AviationWeather.gov."""
+    """UUWW 不再全局禁用 AWC；本测试保留以确认 AWC 请求正常发起."""
     with respx.mock:
         route = respx.get("https://aviationweather.gov/api/data/metar").mock(
             return_value=Response(200, json=[])
         )
         results = await _fetch_awc_batch(["UUWW", "KJFK"], test_settings)
 
-    # UUWW 被过滤，KJFK 仍发起请求
-    assert "UUWW" not in results
+    # UUWW 请求仍会发起
     assert route.called
+    assert results == {}
 
 
 @pytest.mark.asyncio

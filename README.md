@@ -8,7 +8,8 @@
 - **择优合并**：两个数据源分别存入 `metar:{icao}:source:weathergov` 与 `metar:{icao}:source:awc`，系统按 `observed_at` 取最新、同时间按延迟取最快、仍相同则默认 weather.gov，最终写入 `metar:{icao}`。
 - **数据源透明度**：新增 `GET /api/v1/metar/sources?icao=X` 可查看两个数据源原始记录及当前被选中的 winner。
 - **METAR-only 过滤**：
-  - AWC 仅接收 `metarType` 为 `METAR` 或 `SPECI` 的报文，跳过 `AUTO`。
+  - AWC 接收 `METAR`、`SPECI`、`AUTO` 报文（AUTO 视为有效 METAR，与 T0TX 口径一致）。
+  - 对 `UUWW / LTFM / LLBG` 三个机场，AWC 中的 `SPECI` 报文会被跳过（与 weather.gov 结算口径保持一致）。
   - SynopticData 仅保留 `metar_origin_set_1 == 1` 的真正 METAR/SPECI，避免混入 ASOS/AWOS 自动观测。
 - **精确温度解析**：优先解析 RMK 中的 `Txxxx/Txxxxxxxx` 精确温度组（精度 0.1°C），否则回退到 METAR 主体整数温度。
 - **真实 METAR 时间**：统一从 `rawOb` 文本中的 `ddHHMMZ` 解析 `observed_at`，不再使用数据源的 `reportTime` / `date_time`；解析失败则跳过该条。
@@ -199,7 +200,7 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 
 1. **并发双源批量请求**
    - weather.gov：请求全部监控机场
-   - AWC：请求全部监控机场，但跳过 `AWC_DISABLED_AIRPORTS = {"UUWW"}`
+   - AWC：请求全部监控机场；`AUTO` 报文保留；`UUWW / LTFM / LLBG` 的 `SPECI` 报文跳过
 2. **分别写入 source-specific Key**
    - 仅当该数据源的 METAR 文本 hash 变化时才写入，避免无意义刷新
 3. **追加到历史记录**
@@ -245,8 +246,9 @@ GET /api/v1/metar/sources/history?icao=KORD&start=2026-07-10T00:00:00Z&end=2026-
 
 - **AWC (AviationWeather.gov)**：
   - URL: `https://aviationweather.gov/api/data/metar?ids={icaos}&format=json&hours=1`
-  - 直接返回标准 METAR/SPECI，无需 Token。
-  - `UUWW` 已加入 AWC 黑名单（数据质量不佳）。
+  - 直接返回标准 METAR/SPECI/AUTO，无需 Token。
+  - `AUTO` 报文视为有效 METAR，正常采集。
+  - 对 `UUWW / LTFM / LLBG` 三个机场，跳过 AWC 来源的 `SPECI` 报文（与 weather.gov 结算口径对齐）。
 
 - **weather.gov / SynopticData**：
   - API URL: `https://api.synopticdata.com/v2/stations/timeseries`
