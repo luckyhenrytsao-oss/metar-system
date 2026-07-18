@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 
+import asyncio
+import json
+
+import pytest
+
+import app.main
 from app.database import set_metar
+from app.events import publish_event, subscribe, unsubscribe
+from app.main import _event_stream
 
 
 class TestMetarEndpoint:
@@ -165,3 +173,112 @@ class TestBatchMetarEndpoint:
         result = response.json()
         assert result["count"] == 1
         assert result["missing"] == ["NODATA"]
+
+
+class TestEventBus:
+    """测试内存事件总线."""
+
+    @pytest.mark.asyncio
+    async def test_publish_and_subscribe(self):
+        """订阅者能收到发布的事件."""
+        queue = subscribe()
+        try:
+            event = {"event_type": "winner_update", "icao": "KJFK", "temp": 25.0}
+            await publish_event(event)
+            received = await asyncio.wait_for(queue.get(), timeout=1.0)
+            assert received == event
+        finally:
+            unsubscribe(queue)
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_stops_receiving(self):
+        """取消订阅后不再收到事件."""
+        queue = subscribe()
+        unsubscribe(queue)
+        await publish_event({"event_type": "winner_update", "icao": "KJFK"})
+        assert queue.empty()
+
+
+class TestMetarStreamEndpoint:
+    """测试 GET /api/v1/metar/stream SSE 接口."""
+
+    @pytest.mark.asyncio
+    async def test_event_stream_yields_snapshot(self, fake_redis):
+        """_event_stream 生成器在连接后先发送 snapshot."""
+        await set_metar(
+            fake_redis,
+            "KJFK",
+            {
+                "icao": "KJFK",
+                "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+                "observed_at": "2026-07-05T04:55:00+00:00",
+                "updated_at": "2026-07-05T04:55:00+00:00",
+                "hash": "abc123def456",
+                "source": "aviationweather.gov",
+                "source_key": "awc",
+            },
+            7200,
+        )
+
+        gen = _event_stream({"KJFK"}, fake_redis, heartbeat_interval=0.05)
+        chunks = []
+        async for chunk in gen:
+            chunks.append(chunk)
+            if "event: snapshot" in chunk:
+                break
+
+        snapshot_text = "".join(chunks)
+        assert "event: snapshot" in snapshot_text
+        assert '"icao": "KJFK"' in snapshot_text
+        assert "25.0" in snapshot_text
+
+    @pytest.mark.asyncio
+    async def test_event_stream_yields_published_event(self, fake_redis):
+        """_event_stream 能收到后续发布的事件."""
+        await set_metar(
+            fake_redis,
+            "KJFK",
+            {
+                "icao": "KJFK",
+                "raw_text": "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012",
+                "observed_at": "2026-07-05T04:55:00+00:00",
+                "updated_at": "2026-07-05T04:55:00+00:00",
+                "hash": "abc123def456",
+                "source": "aviationweather.gov",
+                "source_key": "awc",
+            },
+            7200,
+        )
+
+        gen = _event_stream({"KJFK"}, fake_redis, heartbeat_interval=0.05)
+
+        # 消费 snapshot
+        async for chunk in gen:
+            if "event: snapshot" in chunk:
+                break
+
+        # 发布事件
+        event = {
+            "event_type": "winner_update",
+            "icao": "KJFK",
+            "raw_text": "METAR KJFK 050500Z 25012KT 10SM FEW250 24/17 A3010",
+            "hash": "newhash123",
+            "previous_hash": "abc123def456",
+            "source": "weather.gov",
+            "source_key": "weathergov",
+            "observed_at": "2026-07-05T05:00:00+00:00",
+            "updated_at": "2026-07-05T05:00:01+00:00",
+        }
+        await publish_event(event)
+
+        found = False
+        async for chunk in gen:
+            if "winner_update" in chunk and "newhash123" in chunk:
+                found = True
+                break
+        assert found, "SSE stream should receive published winner_update event"
+
+    def test_stream_filters_unknown_icao(self, test_client):
+        """请求未监控的机场返回 404."""
+        response = test_client.get("/api/v1/metar/stream?icaos=ZZZZ")
+        assert response.status_code == 404

@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.collector import close_http_client, start_collector_loop
@@ -21,6 +21,7 @@ from app.database import (
     get_source_metar,
     parse_iso,
 )
+from app.events import publish_event, subscribe, unsubscribe
 
 # 配置日志
 logging.basicConfig(
@@ -373,6 +374,7 @@ async def health_check():
 
 # 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
 import asyncio  # noqa: E402
+import json  # noqa: E402
 import re  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
@@ -419,6 +421,106 @@ class BatchMetarRequest(BaseModel):
     """批量请求体."""
 
     icaos: list[str]
+
+
+async def _event_stream(
+    icaos: Optional[set[str]],
+    redis_client: Any,
+    heartbeat_interval: float = 20.0,
+) -> Any:
+    """SSE 事件流生成器.
+
+    - 连接建立时发送当前所有监控机场的 snapshot
+    - 之后监听采集器发布的事件, 有过滤条件时只推送匹配的机场
+    - 定期发送 heartbeat 注释保持连接
+    """
+    queue = subscribe()
+    try:
+        # 发送初始 snapshot
+        snapshot: list[dict[str, Any]] = []
+        for code in sorted(icaos or set()):
+            data = await get_metar(redis_client, code)
+            if data is None:
+                continue
+            temp, dewpoint = parse_temperature(data.get("raw_text", ""))
+            snapshot.append(
+                {
+                    "icao": code,
+                    "temperature_c": temp,
+                    "dewpoint_c": dewpoint,
+                    "raw_text": data.get("raw_text"),
+                    "observed_at": data.get("observed_at"),
+                    "updated_at": data.get("updated_at"),
+                    "source": data.get("source"),
+                    "source_key": data.get("source_key"),
+                    "hash": data.get("hash"),
+                }
+            )
+        yield f"event: snapshot\ndata: {json.dumps({'event_type': 'snapshot', 'count': len(snapshot), 'data': snapshot})}\n\n"
+
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=heartbeat_interval
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+
+            if icaos and event.get("icao", "").upper() not in icaos:
+                continue
+
+            # 解析温度, 方便消费者直接拿到温度
+            temp, dewpoint = parse_temperature(event.get("raw_text", ""))
+            event["temperature_c"] = temp
+            event["dewpoint_c"] = dewpoint
+
+            yield f"event: {event['event_type']}\ndata: {json.dumps(event)}\n\n"
+    finally:
+        unsubscribe(queue)
+
+
+@app.get("/api/v1/metar/stream")
+async def metar_event_stream(
+    icaos: Optional[str] = Query(
+        None,
+        description="逗号分隔的 ICAO 机场代码, 只推送这些机场的事件; 为空则推送全部",
+    ),
+    settings: Settings = Depends(get_settings),
+    redis_client: Any = Depends(_get_redis_dependency),
+):
+    """SSE 实时流：推送 METAR 新数据事件.
+
+    事件类型:
+      - snapshot: 连接建立时的当前状态快照
+      - source_update: 某个数据源有新 METAR 数据
+      - winner_update: M2 择优后的最终 METAR 发生变化
+      - correction: 官方修正事件(同一 observed_at 出现不同 hash)
+
+    示例:
+      curl -N "http://localhost:8000/api/v1/metar/stream?icaos=KSEA,KJFK"
+    """
+    monitored = {code.upper() for code in settings.monitor_airports_list}
+
+    requested: Optional[set[str]] = None
+    if icaos:
+        requested = {code.strip().upper() for code in icaos.split(",") if code.strip()}
+        invalid = requested - monitored
+        if invalid:
+            raise HTTPException(
+                status_code=404,
+                detail=f"ICAO codes not monitored: {', '.join(sorted(invalid))}",
+            )
+
+    return StreamingResponse(
+        _event_stream(requested, redis_client),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
+        },
+    )
 
 
 @app.post("/api/v1/metar/batch")

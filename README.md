@@ -15,6 +15,7 @@
 - **真实 METAR 时间**：统一从 `rawOb` 文本中的 `ddHHMMZ` 解析 `observed_at`，不再使用数据源的 `reportTime` / `date_time`；解析失败则跳过该条。
 - **去重写入**：计算 METAR 文本 SHA1 hash，仅在有变化时覆盖 Redis，每次刷新 2 小时 TTL。
 - **HTTP 304 优化**：客户端携带 `If-None-Match` 匹配 hash 时返回 304 空 Body，最大限度压缩跨洋带宽。
+- **SSE 实时推送**：新增 `GET /api/v1/metar/stream`，一条长连接即可实时接收 METAR 更新、数据源更新和官方修正事件，显著降低 T0TX/M1 等下游消费者的端口消耗。
 - **永不崩溃的采集循环**：外层 `try-except` 捕获所有网络异常，500/429/Timeout 均不会终止后台任务。
 
 ## 项目结构
@@ -82,6 +83,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `GET /api/v1/metar?icao={ICAO_CODE}` —— 获取择优后的最终 METAR
 - `GET /api/v1/metar/sources?icao={ICAO_CODE}` —— 获取两个数据源的最新原始记录及当前 winner
 - `GET /api/v1/metar/sources/history?icao={ICAO_CODE}&hours={N}` —— 按时间窗口查询历史双源对比（支持 `start`/`end`）
+- `GET /api/v1/metar/stream?icaos={ICAO1,ICAO2}` —— SSE 实时流：推送 snapshot + 新 METAR 事件
 - `POST /api/v1/metar/batch` —— 批量获取温度解析结果
 - `GET /health` —— 健康检查
 
@@ -93,6 +95,9 @@ curl -i "http://127.0.0.1:8000/api/v1/metar?icao=KJFK" -H 'If-None-Match: "hashv
 curl -i "http://127.0.0.1:8000/api/v1/metar/sources?icao=KSEA"
 curl -i "http://127.0.0.1:8000/api/v1/metar/sources/history?icao=KSEA&hours=24"
 curl -i "http://127.0.0.1:8000/api/v1/metar/sources/history?icao=KSEA&start=2026-07-10T00:00:00Z&end=2026-07-11T00:00:00Z"
+
+# SSE 实时流（推荐 T0TX/M1 使用）
+curl -N "http://127.0.0.1:8000/api/v1/metar/stream?icaos=KSEA,KJFK"
 ```
 
 ## Docker 本地运行
@@ -214,6 +219,30 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
    - 若仍相同，默认选择 weather.gov
 5. **写入最终 Key**
    - 若择优结果 hash 变化，覆盖 `metar:{icao}`
+
+## SSE 实时推送
+
+`GET /api/v1/metar/stream?icaos={逗号分隔的ICAO代码}`
+
+- 连接建立后先发送一次 `snapshot` 事件，包含当前所有请求机场的择优 METAR。
+- 之后每当 M2 采集到新的 METAR 数据，会实时推送以下事件：
+  - `source_update`：某个数据源（AWC / weather.gov）有新数据
+  - `winner_update`：M2 择优后的最终 METAR 发生变化
+  - `correction`：官方修正事件（同一 observed_at 出现不同 hash）
+- 每 20 秒发送一次 heartbeat 注释保持连接。
+- 不指定 `icaos` 时推送全部监控机场的事件。
+
+每个事件都包含 `temperature_c` 和 `dewpoint_c`，方便下游直接消费。
+
+```text
+event: snapshot
+data: {"event_type": "snapshot", "count": 2, "data": [...]}
+
+event: winner_update
+data: {"event_type": "winner_update", "icao": "KSEA", "temperature_c": 23.3, ...}
+```
+
+**为什么用 SSE 而不是 WebSocket**：METAR 场景是单向 server→client 推送，SSE 基于 HTTP，Nginx 原生支持，客户端重连简单，跨洋/跨 VPN 稳定性更好。
 
 ## 历史接口
 

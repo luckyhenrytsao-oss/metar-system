@@ -532,7 +532,25 @@ async def _store_source_if_changed(
     # 同时追加到历史记录，用于 Dashboard 按时间窗口回溯
     is_new_history = await add_source_history(redis_client, icao, source, payload)
 
+    # 发布 source_update 事件到 SSE 等长连接消费者
+    from app.events import publish_event
+
+    await publish_event(
+        {
+            "event_type": "source_update",
+            "icao": icao,
+            "source_key": source,
+            "source": payload["source"],
+            "observed_at": payload["observed_at"],
+            "updated_at": payload["updated_at"],
+            "raw_text": payload["raw_text"],
+            "hash": new_hash,
+            "previous_hash": existing_hash,
+        }
+    )
+
     # 官方修正事件检测：同一 observed_at 出现了新的 hash
+    correction_event = None
     if is_new_history:
         obs_dt = _parse_observed_at(payload["observed_at"])
         if obs_dt is not None:
@@ -548,14 +566,30 @@ async def _store_source_if_changed(
             if prior_different:
                 # 按 updated_at 排序，取最早出现的那条作为 first_record
                 prior_different.sort(key=lambda r: r.get("updated_at") or "")
+                first_record = prior_different[0]
                 await record_correction_event(
                     redis_client,
                     icao,
                     source,
                     obs_dt,
-                    first_record=prior_different[0],
+                    first_record=first_record,
                     corrected_record=payload,
                 )
+                correction_event = {
+                    "event_type": "correction",
+                    "icao": icao,
+                    "source_key": source,
+                    "source": payload["source"],
+                    "observed_at": payload["observed_at"],
+                    "updated_at": payload["updated_at"],
+                    "raw_text": payload["raw_text"],
+                    "hash": new_hash,
+                    "previous_hash": first_record.get("hash"),
+                    "previous_raw_text": first_record.get("raw_text"),
+                }
+
+    if correction_event:
+        await publish_event(correction_event)
 
     logger.info(
         "Source METAR updated for %s/%s (hash=%s... source=%s)",
@@ -594,6 +628,24 @@ async def _store_winner_if_changed(
         "source_key": winner.get("source_key", "unknown"),
     }
     await set_metar(redis_client, icao, payload, cfg.metar_ttl_seconds)
+
+    # 发布 winner_update 事件到 SSE 等长连接消费者
+    from app.events import publish_event
+
+    await publish_event(
+        {
+            "event_type": "winner_update",
+            "icao": icao,
+            "source_key": payload["source_key"],
+            "source": payload["source"],
+            "observed_at": payload["observed_at"],
+            "updated_at": payload["updated_at"],
+            "raw_text": payload["raw_text"],
+            "hash": new_hash,
+            "previous_hash": existing_hash,
+        }
+    )
+
     logger.info(
         "Adopted METAR updated for %s (hash=%s... source=%s/%s)",
         icao,
