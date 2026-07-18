@@ -234,15 +234,90 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 
 每个事件都包含 `temperature_c` 和 `dewpoint_c`，方便下游直接消费。
 
-```text
-event: snapshot
-data: {"event_type": "snapshot", "count": 2, "data": [...]}
+### 事件字段说明
 
-event: winner_update
-data: {"event_type": "winner_update", "icao": "KSEA", "temperature_c": 23.3, ...}
+#### `snapshot`
+
+```json
+{
+  "event_type": "snapshot",
+  "count": 2,
+  "data": [
+    {
+      "icao": "KSEA",
+      "temperature_c": 13.9,
+      "dewpoint_c": 11.7,
+      "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+      "observed_at": "2026-07-10T10:53:00+00:00",
+      "updated_at": "2026-07-10T10:55:20+00:00",
+      "source": "aviationweather.gov",
+      "source_key": "awc",
+      "hash": "a1b2c3d4..."
+    }
+  ]
+}
 ```
 
-**为什么用 SSE 而不是 WebSocket**：METAR 场景是单向 server→client 推送，SSE 基于 HTTP，Nginx 原生支持，客户端重连简单，跨洋/跨 VPN 稳定性更好。
+#### `winner_update`（M2 择优后的最终 METAR）
+
+推荐 T0TX 只消费此事件，把 M2 当作一个独立数据源：
+
+```json
+{
+  "event_type": "winner_update",
+  "icao": "KSEA",
+  "source_key": "awc",
+  "source": "aviationweather.gov",
+  "observed_at": "2026-07-10T10:53:00+00:00",
+  "updated_at": "2026-07-10T10:55:20+00:00",
+  "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+  "hash": "a1b2c3d4...",
+  "previous_hash": "e5f6g7h8...",
+  "temperature_c": 13.9,
+  "dewpoint_c": 11.7
+}
+```
+
+#### `source_update`（数据源原始更新）
+
+```json
+{
+  "event_type": "source_update",
+  "icao": "KSEA",
+  "source_key": "weathergov",
+  "source": "weather.gov",
+  "observed_at": "2026-07-10T10:53:00+00:00",
+  "updated_at": "2026-07-10T10:55:22+00:00",
+  "raw_text": "METAR KSEA 101053Z 25004KT 10SM SCT060 14/12 A2997 RMK AO2 T01390117",
+  "hash": "x1y2z3...",
+  "previous_hash": "p9q8r7...",
+  "temperature_c": 13.9,
+  "dewpoint_c": 11.7
+}
+```
+
+#### `correction`（官方修正事件）
+
+```json
+{
+  "event_type": "correction",
+  "icao": "VILK",
+  "source_key": "weathergov",
+  "source": "weather.gov",
+  "observed_at": "2026-07-12T21:30:00+00:00",
+  "updated_at": "2026-07-12T21:35:22+00:00",
+  "raw_text": "METAR VILK 122130Z ... 30/24 Q0997 NOSIG",
+  "hash": "newhash...",
+  "previous_hash": "oldhash...",
+  "previous_raw_text": "METAR VILK 122130Z ... 29/24 Q0997 NOSIG",
+  "temperature_c": 30.0,
+  "dewpoint_c": 24.0
+}
+```
+
+### 为什么用 SSE 而不是 WebSocket
+
+METAR 场景是单向 server→client 推送，SSE 基于 HTTP，Nginx 原生支持，客户端重连简单，跨洋/跨 VPN 稳定性更好。
 
 ## 历史接口
 

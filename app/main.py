@@ -433,49 +433,64 @@ async def _event_stream(
     - 连接建立时发送当前所有监控机场的 snapshot
     - 之后监听采集器发布的事件, 有过滤条件时只推送匹配的机场
     - 定期发送 heartbeat 注释保持连接
+    - 内部异常会被捕获并记录, 避免连接异常断开而不留日志
     """
     queue = subscribe()
     try:
         # 发送初始 snapshot
         snapshot: list[dict[str, Any]] = []
-        for code in sorted(icaos or set()):
-            data = await get_metar(redis_client, code)
-            if data is None:
-                continue
-            temp, dewpoint = parse_temperature(data.get("raw_text", ""))
-            snapshot.append(
-                {
-                    "icao": code,
-                    "temperature_c": temp,
-                    "dewpoint_c": dewpoint,
-                    "raw_text": data.get("raw_text"),
-                    "observed_at": data.get("observed_at"),
-                    "updated_at": data.get("updated_at"),
-                    "source": data.get("source"),
-                    "source_key": data.get("source_key"),
-                    "hash": data.get("hash"),
-                }
-            )
+        try:
+            for code in sorted(icaos or set()):
+                data = await get_metar(redis_client, code)
+                if data is None:
+                    continue
+                temp, dewpoint = parse_temperature(data.get("raw_text", ""))
+                snapshot.append(
+                    {
+                        "icao": code,
+                        "temperature_c": temp,
+                        "dewpoint_c": dewpoint,
+                        "raw_text": data.get("raw_text"),
+                        "observed_at": data.get("observed_at"),
+                        "updated_at": data.get("updated_at"),
+                        "source": data.get("source"),
+                        "source_key": data.get("source_key"),
+                        "hash": data.get("hash"),
+                    }
+                )
+        except Exception as exc:
+            logger.error("Failed to build SSE snapshot: %s", exc)
+            snapshot = []
+
         yield f"event: snapshot\ndata: {json.dumps({'event_type': 'snapshot', 'count': len(snapshot), 'data': snapshot})}\n\n"
 
         while True:
             try:
-                event = await asyncio.wait_for(
-                    queue.get(), timeout=heartbeat_interval
-                )
-            except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
-                continue
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=heartbeat_interval
+                    )
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
 
-            if icaos and event.get("icao", "").upper() not in icaos:
-                continue
+                if icaos and event.get("icao", "").upper() not in icaos:
+                    continue
 
-            # 解析温度, 方便消费者直接拿到温度
-            temp, dewpoint = parse_temperature(event.get("raw_text", ""))
-            event["temperature_c"] = temp
-            event["dewpoint_c"] = dewpoint
+                # 解析温度, 方便消费者直接拿到温度
+                temp, dewpoint = parse_temperature(event.get("raw_text", ""))
+                event["temperature_c"] = temp
+                event["dewpoint_c"] = dewpoint
 
-            yield f"event: {event['event_type']}\ndata: {json.dumps(event)}\n\n"
+                yield f"event: {event['event_type']}\ndata: {json.dumps(event)}\n\n"
+            except Exception as exc:
+                logger.error("SSE event loop error: %s", exc)
+                # 发送一个 error 事件后优雅关闭, 让客户端有机会重连
+                try:
+                    yield f"event: error\ndata: {json.dumps({'event_type': 'error', 'message': str(exc)})}\n\n"
+                except Exception:
+                    pass
+                break
     finally:
         unsubscribe(queue)
 
