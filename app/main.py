@@ -426,13 +426,13 @@ class BatchMetarRequest(BaseModel):
 async def _event_stream(
     icaos: Optional[set[str]],
     redis_client: Any,
-    heartbeat_interval: float = 20.0,
+    heartbeat_interval: float = 10.0,
 ) -> Any:
     """SSE 事件流生成器.
 
     - 连接建立时发送当前所有监控机场的 snapshot
     - 之后监听采集器发布的事件, 有过滤条件时只推送匹配的机场
-    - 定期发送 heartbeat 注释保持连接
+    - 定期发送 heartbeat 注释保持连接（默认 10s，可调）
     - 内部异常会被捕获并记录, 避免连接异常断开而不留日志
     """
     queue = subscribe()
@@ -501,6 +501,12 @@ async def metar_event_stream(
         None,
         description="逗号分隔的 ICAO 机场代码, 只推送这些机场的事件; 为空则推送全部",
     ),
+    heartbeat: float = Query(
+        10.0,
+        ge=1.0,
+        le=60.0,
+        description="心跳间隔秒数(1~60, 默认 10), 用于兼容不同代理/NAT 超时",
+    ),
     settings: Settings = Depends(get_settings),
     redis_client: Any = Depends(_get_redis_dependency),
 ):
@@ -512,8 +518,12 @@ async def metar_event_stream(
       - winner_update: M2 择优后的最终 METAR 发生变化
       - correction: 官方修正事件(同一 observed_at 出现不同 hash)
 
+    参数:
+      - icaos: 逗号分隔的 ICAO 机场代码
+      - heartbeat: 心跳间隔秒数(1~60, 默认 10)
+
     示例:
-      curl -N "http://localhost:8000/api/v1/metar/stream?icaos=KSEA,KJFK"
+      curl -N "http://localhost:8000/api/v1/metar/stream?icaos=KSEA,KJFK&heartbeat=5"
     """
     monitored = {code.upper() for code in settings.monitor_airports_list}
 
@@ -528,10 +538,10 @@ async def metar_event_stream(
             )
 
     return StreamingResponse(
-        _event_stream(requested, redis_client),
+        _event_stream(requested, redis_client, heartbeat_interval=heartbeat),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
         },

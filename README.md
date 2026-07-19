@@ -98,6 +98,9 @@ curl -i "http://127.0.0.1:8000/api/v1/metar/sources/history?icao=KSEA&start=2026
 
 # SSE 实时流（推荐 T0TX/M1 使用）
 curl -N "http://127.0.0.1:8000/api/v1/metar/stream?icaos=KSEA,KJFK"
+
+# SSE 高频心跳（适合 Clash/VPN/NAT 环境）
+curl -N "http://127.0.0.1:8000/api/v1/metar/stream?icaos=KSEA,KJFK&heartbeat=5"
 ```
 
 ## Docker 本地运行
@@ -318,6 +321,40 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 ### 为什么用 SSE 而不是 WebSocket
 
 METAR 场景是单向 server→client 推送，SSE 基于 HTTP，Nginx 原生支持，客户端重连简单，跨洋/跨 VPN 稳定性更好。
+
+### 心跳与断线重连
+
+- 默认每 **10 秒** 发送一次 heartbeat（`: heartbeat` 注释）。
+- 如果中间代理（Clash Verge、VPN、NAT）对空闲连接更敏感，可通过 `?heartbeat=5` 缩短到 5 秒。
+- 客户端应实现**断线自动重连**：SSE 连接被代理切断是正常现象，重连后会收到新的 `snapshot`，之后继续接收增量事件。
+
+### T0TX 消费建议
+
+T0TX 可以只监听 `winner_update`，把 M2 当作一个独立数据源：
+
+```python
+import requests
+import json
+
+url = "http://47.251.25.183/api/v1/metar/stream?icaos=KSEA,KJFK&heartbeat=5"
+while True:
+    try:
+        with requests.get(url, stream=True, timeout=30) as resp:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                text = line.decode("utf-8")
+                if text.startswith("event: winner_update"):
+                    data_line = next(resp.iter_lines()).decode("utf-8")
+                    event = json.loads(data_line[len("data: "):])
+                    print(event["icao"], event["temperature_c"], event["observed_at"])
+                elif text.startswith("event: snapshot"):
+                    # 重连后的初始状态，可按需初始化本地缓存
+                    pass
+    except Exception as exc:
+        print("SSE disconnected, reconnecting:", exc)
+        time.sleep(1)
+```
 
 ## 历史接口
 
