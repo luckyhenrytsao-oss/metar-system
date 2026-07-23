@@ -283,8 +283,12 @@ async def _fetch_weathergov_batch(
 
 
 def _has_precision_temp(raw_text: str) -> bool:
-    """判断报文是否包含 RMK 精确温度组 Txxxx/Txxxxxxxx."""
-    return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}\b", raw_text))
+    """判断报文是否包含 RMK 精确温度组 Txxxx/Txxxxxxxx.
+
+    部分报文 T 组后有额外数字（如 T017201444），因此正则去掉尾部 \b，
+    只要报文中出现 T 后跟 8 位数字即视为含精确温度组。
+    """
+    return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}", raw_text))
 
 
 # 对以下机场，AWC 的 SPECI 报文需要跳过。

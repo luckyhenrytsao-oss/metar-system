@@ -393,7 +393,9 @@ def parse_temperature(raw_text: str) -> tuple[Optional[float], Optional[float]]:
 
     # 1. 优先解析 RMK 中的精确 T 组：T 后跟 8 位数字（气温4位+露点4位）
     #    每位第一位是符号位：1 表示负，0 表示正
-    rmk_match = re.search(r"\bT(0|1)(\d{3})(0|1)(\d{3})\b", raw_text)
+    #    注意：上游部分报文 T 组后有额外数字（如 T017201444），去掉尾部 \b
+    #    让正则匹配前 8 位即可，避免 fallback 到整数温度。
+    rmk_match = re.search(r"\bT(0|1)(\d{3})(0|1)(\d{3})", raw_text)
     if rmk_match:
         temp_sign = -1 if rmk_match.group(1) == "1" else 1
         temp_val = int(rmk_match.group(2))

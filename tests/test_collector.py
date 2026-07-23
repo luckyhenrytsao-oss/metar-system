@@ -13,6 +13,7 @@ from app.collector import (
     _fetch_airport,
     _fetch_awc_batch,
     _fetch_weathergov_batch,
+    _has_precision_temp,
     _merge_and_store_winners,
     _parse_metar_time,
     _select_winner,
@@ -506,6 +507,27 @@ def test_parse_metar_time_cross_day():
     assert parsed.day == 4
     assert parsed.hour == 23
     assert parsed.minute == 50
+
+
+def test_has_precision_temp_9_digit_group():
+    """9 位 T 组（如 T017201444）也应识别为含精确温度组."""
+    assert _has_precision_temp(
+        "METAR KSEA 230853Z 24008KT 10SM FEW020 17/14 A3000 RMK AO2 T017201444 50003"
+    )
+
+
+def test_has_precision_temp_negative():
+    """负温度 T 组也能被识别."""
+    assert _has_precision_temp(
+        "METAR KSEA 230853Z 24008KT 10SM FEW020 M01/M05 A3000 RMK AO2 T10131015"
+    )
+
+
+def test_has_precision_temp_missing():
+    """无 RMK T 组时应返回 False."""
+    assert not _has_precision_temp(
+        "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012"
+    )
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ import pytest
 import app.main
 from app.database import set_metar
 from app.events import publish_event, subscribe, unsubscribe
-from app.main import _event_stream
+from app.main import _event_stream, parse_temperature
 
 
 class TestMetarEndpoint:
@@ -282,3 +282,39 @@ class TestMetarStreamEndpoint:
         """请求未监控的机场返回 404."""
         response = test_client.get("/api/v1/metar/stream?icaos=ZZZZ")
         assert response.status_code == 404
+
+
+class TestParseTemperature:
+    """测试 parse_temperature 对 RMK T 组精确温度的解析."""
+
+    def test_parse_8_digit_t_group(self):
+        """标准 8 位 T 组应正确解析."""
+        temp, dewpoint = parse_temperature(
+            "METAR KSEA 230953Z 24008KT 10SM FEW020 17/14 A3000 RMK AO2 T01670144"
+        )
+        assert temp == 16.7
+        assert dewpoint == 14.4
+
+    def test_parse_9_digit_t_group(self):
+        """9 位 T 组（如 T017201444）应取前 8 位解析，尾部多余数字忽略."""
+        temp, dewpoint = parse_temperature(
+            "METAR KSEA 230853Z 24008KT 10SM FEW020 17/14 A3000 RMK AO2 T017201444 50003"
+        )
+        assert temp == 17.2
+        assert dewpoint == 14.4
+
+    def test_parse_negative_t_group(self):
+        """负温度符号位为 1."""
+        temp, dewpoint = parse_temperature(
+            "METAR KSEA 230853Z 24008KT 10SM FEW020 M01/M05 A3000 RMK AO2 T10131015"
+        )
+        assert temp == -1.3
+        assert dewpoint == -1.5
+
+    def test_fallback_to_main_temp(self):
+        """无 RMK T 组时回退到主体 TT/DD."""
+        temp, dewpoint = parse_temperature(
+            "METAR KJFK 050455Z 24008KT 10SM FEW250 25/18 A3012"
+        )
+        assert temp == 25.0
+        assert dewpoint == 18.0
