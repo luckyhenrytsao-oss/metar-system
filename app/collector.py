@@ -372,6 +372,18 @@ _IEM_WMO_HEADER_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{2}\d{2}\s+[A-Z]{4}")
 # "KSEA 240953Z ..." 开头。因此正则让前缀可选，但仍要求 Z 结尾，避免匹配 WMO 报头。
 _IEM_METAR_RE = re.compile(r"(?:^|\s)(?:METAR|SPECI)?\s*([A-Z]{4})\s+(\d{6})Z\b")
 
+# 对以下机场，IEM LDM 的 SPECI 报文需要跳过。
+# 原因：这些机场的 weather.gov 结算源存在"整点抽样原则"，会跳过 SPECI 报告；
+# IEM 作为原始 GTS 流会包含 SPECI，需要同样过滤以与结算口径保持一致。
+IEM_SPECI_FILTER_STATIONS = {"UUWW", "LTFM", "LLBG"}
+
+
+def _is_iem_speci_filtered(icao: str, raw_text: str) -> bool:
+    """判断某条 IEM LDM 记录是否需要因 SPECI 过滤而跳过."""
+    if icao.upper() not in IEM_SPECI_FILTER_STATIONS:
+        return False
+    return bool(raw_text and raw_text.upper().startswith("SPECI "))
+
 
 def _parse_iem_bulletins(
     text: str,
@@ -426,6 +438,11 @@ def _parse_iem_bulletins(
             end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
             raw_text = body[start:end].strip()
             if not raw_text:
+                continue
+
+            # 对特定机场过滤 IEM SPECI，避免与 weather.gov 结算口径不一致
+            if _is_iem_speci_filtered(icao, raw_text):
+                logger.debug("Skipping IEM SPECI for %s: %s", icao, raw_text[:60])
                 continue
 
             # 统一从 raw_text 中的 ddHHMMZ 解析真实 METAR 时间

@@ -757,6 +757,29 @@ def test_parse_iem_bulletins_no_metar_prefix():
     assert results["KSEA"]["raw_text"].startswith("KSEA 240153Z")
 
 
+def test_parse_iem_bulletins_filters_speci_for_uuww():
+    """UUWW 的 IEM LDM SPECI 报文应被跳过，保留同一机场的 METAR."""
+    text = (
+        "SAXX99 KWBC 240200\n"
+        "SPECI UUWW 240155Z 01003MPS CAVOK 21/12 Q1011 "
+        "METAR UUWW 240130Z 01003MPS CAVOK 21/12 Q1011="
+    )
+    results = _parse_iem_bulletins(text, {"UUWW"})
+
+    assert "UUWW" in results
+    assert "SPECI" not in results["UUWW"]["raw_text"]
+    assert results["UUWW"]["raw_text"].startswith("METAR UUWW")
+
+
+def test_parse_iem_bulletins_keeps_speci_for_other_stations():
+    """非过滤列表机场的 IEM LDM SPECI 报文正常保留."""
+    text = "SAXX99 KWBC 240200\nSPECI KJFK 240155Z 24008KT 10SM 25/18 A3012="
+    results = _parse_iem_bulletins(text, {"KJFK"})
+
+    assert "KJFK" in results
+    assert results["KJFK"]["raw_text"].startswith("SPECI KJFK")
+
+
 def test_parse_iem_bulletins_prefers_later_observed_at():
     """同一机场在同一批数据中有多个报告时保留 observed_at 最新的."""
     text = (
