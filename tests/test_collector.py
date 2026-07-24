@@ -684,18 +684,21 @@ class TestIemLdmReader:
             f.write("SAXX99 KWBC 240300\nMETAR KSEA 240253Z ...=")
         assert reader.read_new() == "SAXX99 KWBC 240300\nMETAR KSEA 240253Z ...="
 
-    def test_read_new_resets_on_rotation(self, tmp_path):
-        """文件被替换（inode 变化）后从头读取."""
+    def test_read_new_resets_on_truncation(self, tmp_path):
+        """文件被截断（大小小于上次 offset）后从头读取."""
         file_path = tmp_path / "metars.txt"
-        file_path.write_text("old content", encoding="utf-8")
+        file_path.write_text(
+            "SAXX99 KWBC 240200\nMETAR KSEA 240153Z ...=",
+            encoding="utf-8",
+            newline="\n",
+        )
         reader = _IemLdmReader(file_path)
         reader.read_new()
 
-        # 模拟轮转：删除旧文件，创建新文件
-        file_path.unlink()
-        file_path.write_text("new content", encoding="utf-8")
+        # 模拟文件被清空/截断
+        file_path.write_text("truncated content", encoding="utf-8", newline="\n")
 
-        assert reader.read_new() == "new content"
+        assert reader.read_new() == "truncated content"
 
     def test_truncate_clears_file(self, tmp_path):
         """truncate 清空文件并重置 offset."""
