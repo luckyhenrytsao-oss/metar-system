@@ -20,6 +20,11 @@ COMPOSE_FILE_URL="https://raw.githubusercontent.com/${GHCR_USERNAME}/metar-syste
 NGINX_CONF_URL="https://raw.githubusercontent.com/${GHCR_USERNAME}/metar-system/main/nginx/metar.conf"
 USER_AGENT="MyMetarApp/1.0 (htsao2000@gmail.com)"
 
+# IEM LDM 配置（VPS IP 需已加入 IEM 白名单）
+IEM_LDM_ENABLED="true"
+IEM_LDM_FILE_PATH="/app/ldm_data/metar/metars.txt"
+IEM_LDM_TRUNCATE_INTERVAL_HOURS="1"
+
 # ---------------- 1. 安装依赖 ----------------
 echo "[1/7] 安装 Docker、Nginx..."
 if command -v dnf &>/dev/null; then
@@ -46,6 +51,10 @@ echo "[2/7] 创建项目目录 ${PROJECT_DIR}..."
 mkdir -p "${PROJECT_DIR}"
 cd "${PROJECT_DIR}"
 
+# 创建 LDM 所需目录并设置权限（LDM 容器以 UID/GID=1000 运行）
+mkdir -p m2-ldm/data/metar m2-ldm/logs m2-ldm/queues
+chown -R 1000:1000 m2-ldm/data m2-ldm/logs m2-ldm/queues || true
+
 # ---------------- 3. 下载 docker-compose.yml ----------------
 echo "[3/7] 下载 docker-compose.yml..."
 curl -fsSL "${COMPOSE_FILE_URL}" -o docker-compose.yml
@@ -55,11 +64,14 @@ echo "[4/7] 生成 .env 配置文件..."
 cat > .env <<EOF
 REDIS_URL=redis://redis:6379/0
 MONITOR_AIRPORTS=ZSPD,ZBAA,EGLC,RKSI,WSSS,LFPB,KSEA,KATL,KORD,KLGA,RJTT,KDAL,ZUUU,ZUCK,ZGGG,ZGSZ,ZHHH,ZSQD,EPWA,WMKK,RCSS,LLBG,RKPK,LIMC,KMIA,NZWN,KBKF,RPLL,CYYZ,SBGR,EDDM,KLAX,KAUS,EHAM,SAEZ,KSFO,LTAC,LTFM,FACT,VILK,OPKC,MPMG,KHOU,MMMX,OEJN,EFHK,LEMD,VHHH,UUWW
-POLL_INTERVAL_SECONDS=1.5
+POLL_INTERVAL_SECONDS=1.0
 METAR_TTL_SECONDS=7200
 USER_AGENT=${USER_AGENT}
 HTTP_TIMEOUT=15.0
 LOG_LEVEL=INFO
+IEM_LDM_ENABLED=${IEM_LDM_ENABLED}
+IEM_LDM_FILE_PATH=${IEM_LDM_FILE_PATH}
+IEM_LDM_TRUNCATE_INTERVAL_HOURS=${IEM_LDM_TRUNCATE_INTERVAL_HOURS}
 EOF
 
 # ---------------- 5. 登录 GHCR 并启动容器 ----------------
@@ -95,6 +107,9 @@ curl -fsS "http://127.0.0.1:${APP_PORT}/health" && echo ""
 
 echo "--- 示例 API (VHHH) ---"
 curl -fsS "http://127.0.0.1:${APP_PORT}/api/v1/metar?icao=VHHH" | head -c 300 && echo ""
+
+echo "--- IEM LDM 状态 ---"
+docker compose ps m2-ldm || true
 
 echo "--- Nginx 公网访问测试 ---"
 PUBLIC_IP=$(curl -fsS -4 https://api.ipify.org || echo "127.0.0.1")

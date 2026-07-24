@@ -41,6 +41,23 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # IEM LDM 配置
+    iem_ldm_enabled: bool = Field(
+        default=False,
+        description="是否启用 IEM LDM GTS 数据流采集",
+    )
+
+    iem_ldm_file_path: str = Field(
+        default="/app/ldm_data/metar/metars.txt",
+        description="LDM 写入的 METAR 文件路径（M2 容器内路径）",
+    )
+
+    iem_ldm_truncate_interval_hours: int = Field(
+        default=1,
+        ge=1,
+        description="METAR 文件截断清理间隔（小时）",
+    )
+
     # Redis 连接地址
     redis_url: RedisDsn = Field(
         default="redis://localhost:6379/0",

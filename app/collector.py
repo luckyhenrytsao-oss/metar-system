@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -24,6 +25,10 @@ _http_client: Optional[httpx.AsyncClient] = None
 _weathergov_token: Optional[str] = None
 _weathergov_token_expires: Optional[datetime] = None
 _token_lock = asyncio.Lock()
+
+# IEM LDM 文件读取器
+_iem_ldm_reader: Optional["_IemLdmReader"] = None
+_iem_ldm_last_truncate: Optional[datetime] = None
 
 # API 常量
 AWC_BASE_URL = "https://aviationweather.gov/api/data/metar"
@@ -291,6 +296,222 @@ def _has_precision_temp(raw_text: str) -> bool:
     return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}", raw_text))
 
 
+class _IemLdmReader:
+    """IEM LDM METAR 文件读取器.
+
+    通过维护 inode 和 offset 实现增量读取；文件被轮转或清空时自动重置。
+    支持按配置周期 truncate 文件，防止磁盘无限增长。
+    """
+
+    def __init__(self, file_path: Path) -> None:
+        self.file_path = Path(file_path)
+        self._last_inode: Optional[int] = None
+        self._last_offset = 0
+
+    def read_new(self) -> str:
+        """读取自上次读取以来追加的新内容."""
+        if not self.file_path.exists():
+            return ""
+
+        try:
+            stat = self.file_path.stat()
+        except OSError as exc:
+            logger.warning("Failed to stat IEM LDM file %s: %s", self.file_path, exc)
+            return ""
+
+        inode, size = stat.st_ino, stat.st_size
+
+        # 文件被轮转/清空/替换时重置 offset
+        if self._last_inode is not None and (
+            inode != self._last_inode or size < self._last_offset
+        ):
+            self._last_offset = 0
+
+        if size <= self._last_offset:
+            self._last_inode = inode
+            return ""
+
+        try:
+            with open(self.file_path, "rb") as f:
+                f.seek(self._last_offset)
+                data = f.read(size - self._last_offset)
+        except OSError as exc:
+            logger.warning("Failed to read IEM LDM file %s: %s", self.file_path, exc)
+            return ""
+
+        self._last_inode = inode
+        self._last_offset = size
+        return data.decode("utf-8", errors="replace")
+
+    def truncate(self) -> None:
+        """清空文件并重置 offset."""
+        try:
+            if self.file_path.exists():
+                with open(self.file_path, "wb"):
+                    pass
+        except OSError as exc:
+            logger.warning("Failed to truncate IEM LDM file %s: %s", self.file_path, exc)
+        self._last_offset = 0
+
+
+def _get_iem_ldm_reader(settings: Optional[Settings] = None) -> Optional[_IemLdmReader]:
+    """获取或创建 IEM LDM 文件读取器."""
+    global _iem_ldm_reader
+    if _iem_ldm_reader is None:
+        cfg = settings or get_settings()
+        if cfg.iem_ldm_enabled:
+            _iem_ldm_reader = _IemLdmReader(Path(cfg.iem_ldm_file_path))
+    return _iem_ldm_reader
+
+
+# GTS WMO 报头正则：如 "SAXX99 KWBC 240200"
+_IEM_WMO_HEADER_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{2}\d{2}\s+[A-Z]{4}")
+
+# 单条 METAR/SPECI 起始正则：METAR KSEA 240153Z 或 SPECI KSEA 240153Z
+_IEM_METAR_RE = re.compile(r"\b(METAR|SPECI)\s+([A-Z]{4})\s+(\d{6})Z\b")
+
+
+def _parse_iem_bulletins(
+    text: str,
+    requested_codes: set[str],
+) -> dict[str, dict[str, Any]]:
+    """解析 IEM LDM 推送的 GTS bulletin 文本.
+
+    - 按 "=" 分隔 bulletin
+    - 跳过 WMO 报头行
+    - 从每个 bulletin 中提取所有 METAR/SPECI 报文
+    - 对每个机场保留 observed_at 最新的一条；时间相同时优先保留含 RMK+T 的
+    """
+    if not text:
+        return {}
+
+    # 去掉控制字符，避免解析异常
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    results: dict[str, dict[str, Any]] = {}
+    base_time = _now_utc()
+
+    # GTS bulletin 之间以 "=" 分隔
+    for bulletin in text.split("="):
+        bulletin = bulletin.strip()
+        if not bulletin:
+            continue
+
+        # 去掉 WMO 报头行，只保留 METAR/SPECI 主体
+        body_lines: list[str] = []
+        for line in bulletin.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if _IEM_WMO_HEADER_RE.match(line):
+                continue
+            body_lines.append(line)
+
+        if not body_lines:
+            continue
+
+        body = " ".join(body_lines)
+
+        # 提取当前 bulletin 内所有 METAR/SPECI 报文
+        matches = list(_IEM_METAR_RE.finditer(body))
+        for idx, match in enumerate(matches):
+            report_type = match.group(1)
+            icao = match.group(2)
+
+            if icao not in requested_codes:
+                continue
+
+            start = match.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+            raw_text = body[start:end].strip()
+            if not raw_text:
+                continue
+
+            # 统一从 raw_text 中的 ddHHMMZ 解析真实 METAR 时间
+            obs_time = _parse_metar_time(raw_text, base_time)
+            if obs_time is None:
+                logger.warning(
+                    "Could not parse METAR time from IEM bulletin for %s: %s",
+                    icao,
+                    raw_text[:80],
+                )
+                continue
+
+            record = {
+                "icao": icao,
+                "raw_text": raw_text,
+                "observed_at": obs_time.isoformat(),
+                "source": "IEM LDM",
+                "source_key": "iem",
+            }
+
+            existing = results.get(icao)
+            if existing is None:
+                results[icao] = record
+                continue
+
+            existing_time = _parse_observed_at(existing["observed_at"])
+            # 保留更新的；时间相同时优先保留含精确温度组的
+            if obs_time > existing_time:
+                results[icao] = record
+            elif obs_time == existing_time and _has_precision_temp(raw_text):
+                if not _has_precision_temp(existing["raw_text"]):
+                    results[icao] = record
+
+    return results
+
+
+async def _fetch_iem_batch(
+    codes: list[str],
+    settings: Optional[Settings] = None,
+) -> dict[str, dict[str, Any]]:
+    """从 IEM LDM 文件批量读取最新 METAR.
+
+    - 未启用 LDM 时返回空字典
+    - 文件不存在时记录 warning 并返回空字典（LDM 可能尚未启动或建立连接）
+    """
+    cfg = settings or get_settings()
+    if not cfg.iem_ldm_enabled:
+        return {}
+
+    reader = _get_iem_ldm_reader(cfg)
+    if reader is None:
+        return {}
+
+    requested_codes = {code.upper() for code in codes}
+    new_text = reader.read_new()
+    if not new_text:
+        return {}
+
+    return _parse_iem_bulletins(new_text, requested_codes)
+
+
+def _maybe_truncate_iem_file(settings: Optional[Settings] = None) -> None:
+    """按配置周期清空 IEM LDM 文件，防止磁盘无限增长."""
+    global _iem_ldm_last_truncate
+
+    cfg = settings or get_settings()
+    if not cfg.iem_ldm_enabled:
+        return
+
+    now = _now_utc()
+    interval = timedelta(hours=cfg.iem_ldm_truncate_interval_hours)
+
+    if (
+        _iem_ldm_last_truncate is not None
+        and now - _iem_ldm_last_truncate < interval
+    ):
+        return
+
+    reader = _get_iem_ldm_reader(cfg)
+    if reader is None:
+        return
+
+    reader.truncate()
+    _iem_ldm_last_truncate = now
+    logger.info("Truncated IEM LDM METAR file at %s", now.isoformat())
+
+
 # 对以下机场，AWC 的 SPECI 报文需要跳过。
 # 原因：这些机场的 weather.gov 结算源存在"整点抽样原则"，会跳过 SPECI 报告。
 # 若 M2 采集了 AWC 的 SPECI，会与结算口径不一致。
@@ -447,48 +668,36 @@ def _parse_observed_at(value: Any) -> Optional[datetime]:
 def _select_winner(
     weathergov_record: Optional[dict[str, Any]],
     awc_record: Optional[dict[str, Any]],
+    iem_record: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """从两个数据源记录中选择优胜者.
+    """从三个数据源记录中选择优胜者.
 
     选择规则:
       1. 优先比较 observed_at：时间更晚（更新）的记录胜出
       2. 若 observed_at 相同，比较入库延迟（updated_at - observed_at），延迟更小的胜出
-      3. 若仍相同，默认优先 weather.gov
-      4. 只有一方有数据时，直接使用该方
+      3. 若仍相同，默认优先顺序：weather.gov > AWC > IEM
+      4. 只有部分方有数据时，从有数据的记录中选择最优
     """
-    if weathergov_record is None:
-        return awc_record
-    if awc_record is None:
-        return weathergov_record
+    records = [weathergov_record, awc_record, iem_record]
+    records = [r for r in records if r is not None]
+    if not records:
+        return None
 
-    wg_obs = _parse_observed_at(weathergov_record.get("observed_at"))
-    awc_obs = _parse_observed_at(awc_record.get("observed_at"))
+    # 源优先级：数字越小越优先，用于 exact tie-breaking
+    _SOURCE_PREF = {"weathergov": 0, "awc": 1, "iem": 2}
 
-    if wg_obs is None and awc_obs is None:
-        return weathergov_record
-    if wg_obs is None:
-        return awc_record
-    if awc_obs is None:
-        return weathergov_record
+    def _key(record: dict[str, Any]) -> tuple[int, float, float, int]:
+        obs = _parse_observed_at(record.get("observed_at"))
+        updated = _parse_observed_at(record.get("updated_at"))
+        if obs is None:
+            # observed_at 缺失的记录视为最差
+            return (1, 0.0, float("inf"), 99)
+        latency = (updated - obs).total_seconds() if updated else float("inf")
+        source_pref = _SOURCE_PREF.get(record.get("source_key"), 99)
+        # 0 表示有效 obs；负时间戳让更新鲜的记录 key 更小
+        return (0, -obs.timestamp(), latency, source_pref)
 
-    # 规则 1：更新鲜的 METAR 胜出
-    if wg_obs > awc_obs:
-        return weathergov_record
-    if awc_obs > wg_obs:
-        return awc_record
-
-    # observed_at 相同，比较延迟
-    wg_updated = _parse_observed_at(weathergov_record.get("updated_at"))
-    awc_updated = _parse_observed_at(awc_record.get("updated_at"))
-
-    wg_latency = (wg_updated - wg_obs).total_seconds() if wg_updated else float("inf")
-    awc_latency = (
-        (awc_updated - awc_obs).total_seconds() if awc_updated else float("inf")
-    )
-
-    if awc_latency < wg_latency:
-        return awc_record
-    return weathergov_record
+    return min(records, key=_key)
 
 
 async def _store_source_if_changed(
@@ -664,7 +873,7 @@ async def _merge_and_store_winners(
     redis_client: Any,
     settings: Optional[Settings] = None,
 ) -> None:
-    """为每个监控机场读取两个数据源记录，择优后写入最终 Key."""
+    """为每个监控机场读取三个数据源记录，择优后写入最终 Key."""
     cfg = settings or get_settings()
     from app.database import get_source_metar
 
@@ -673,7 +882,8 @@ async def _merge_and_store_winners(
         try:
             weathergov_record = await get_source_metar(redis_client, icao, "weathergov")
             awc_record = await get_source_metar(redis_client, icao, "awc")
-            winner = _select_winner(weathergov_record, awc_record)
+            iem_record = await get_source_metar(redis_client, icao, "iem")
+            winner = _select_winner(weathergov_record, awc_record, iem_record)
             if winner is None:
                 logger.warning("No METAR data available for %s", icao)
                 continue
@@ -683,14 +893,15 @@ async def _merge_and_store_winners(
 
 
 async def _poll_cycle(settings: Optional[Settings] = None) -> None:
-    """执行一轮采集：两个数据源独立批量采集，分别入库，再择优合并."""
+    """执行一轮采集：三个数据源独立批量采集，分别入库，再择优合并."""
     cfg = settings or get_settings()
     redis_client = await get_redis(cfg)
 
-    # 1. 独立批量采集：weather.gov 采集全部机场，AWC 采集全部机场（除黑名单）
-    weathergov_results, awc_results = await asyncio.gather(
+    # 1. 独立批量采集：weather.gov、AWC、IEM LDM
+    weathergov_results, awc_results, iem_results = await asyncio.gather(
         _fetch_weathergov_batch(cfg.monitor_airports_list, cfg),
         _fetch_awc_batch(cfg.monitor_airports_list, cfg),
+        _fetch_iem_batch(cfg.monitor_airports_list, cfg),
     )
 
     # 2. 将 weather.gov 结果写入 source-specific Key
@@ -709,7 +920,20 @@ async def _poll_cycle(settings: Optional[Settings] = None) -> None:
         except Exception as exc:
             logger.error("Failed to store AWC METAR for %s: %s", code, exc)
 
-    # 4. 为每个机场择优并写入最终 Key
+    # 4. 将 IEM LDM 结果写入 source-specific Key
+    for code, result in iem_results.items():
+        try:
+            await _store_source_if_changed(redis_client, code, "iem", result, cfg)
+        except Exception as exc:
+            logger.error("Failed to store IEM METAR for %s: %s", code, exc)
+
+    # 5. 按配置周期清空 IEM LDM 文件，防止磁盘无限增长
+    try:
+        _maybe_truncate_iem_file(cfg)
+    except Exception as exc:
+        logger.error("Failed to truncate IEM LDM file: %s", exc)
+
+    # 6. 为每个机场择优并写入最终 Key
     await _merge_and_store_winners(redis_client, cfg)
 
 

@@ -1,12 +1,12 @@
 # METAR 高频采集与分发系统
 
-从美国气象局 [weather.gov / SynopticData](https://www.weather.gov) 和 [AviationWeather.gov (AWC)](https://aviationweather.gov) 高频采集航空 METAR 报文，通过 **FastAPI + Redis** 向客户端极速分发。
+从美国气象局 [weather.gov / SynopticData](https://www.weather.gov)、[AviationWeather.gov (AWC)](https://aviationweather.gov) 以及 [IEM/Unidata LDM](https://mesonet.agron.iastate.edu/) GTS 数据流高频采集航空 METAR 报文，通过 **FastAPI + Redis** 向客户端极速分发。
 
 ## 核心特性
 
-- **双源独立采集**：weather.gov 与 AWC 每轮各自批量请求全部监控机场，互相独立、互不影响。
-- **择优合并**：两个数据源分别存入 `metar:{icao}:source:weathergov` 与 `metar:{icao}:source:awc`，系统按 `observed_at` 取最新、同时间按延迟取最快、仍相同则默认 weather.gov，最终写入 `metar:{icao}`。
-- **数据源透明度**：新增 `GET /api/v1/metar/sources?icao=X` 可查看两个数据源原始记录及当前被选中的 winner。
+- **三源独立采集**：weather.gov、AWC 与 IEM LDM 每轮各自独立采集，互不影响。LDM 为近实时 GTS 推送，通常比轮询源更快。
+- **择优合并**：三个数据源分别存入 `metar:{icao}:source:{weathergov|awc|iem}`，系统按 `observed_at` 取最新、同时间按延迟取最快、仍相同则默认 weather.gov > AWC > IEM，最终写入 `metar:{icao}`。
+- **数据源透明度**：`GET /api/v1/metar/sources?icao=X` 可查看三个数据源原始记录及当前被选中的 winner。
 - **METAR-only 过滤**：
   - AWC 接收 `METAR`、`SPECI`、`AUTO` 报文（AUTO 视为有效 METAR，与 T0TX 口径一致）。
   - 对 `UUWW / LTFM / LLBG` 三个机场，AWC 中的 `SPECI` 报文会被跳过（与 weather.gov 结算口径保持一致）。
@@ -42,7 +42,10 @@ metar-system/
 │   ├── vps-first-deploy.sh   # VPS 首次手动部署脚本
 │   └── analyze_source_latency.py  # 双源延迟分析脚本（可选工具）
 ├── Dockerfile             # 多阶段构建
-├── docker-compose.yml     # FastAPI + Redis 7 编排
+├── docker-compose.yml     # FastAPI + Redis 7 + IEM LDM 编排
+├── m2-ldm/                # IEM LDM 配置文件
+│   ├── ldmd.conf          # LDM 上游请求配置
+│   └── pqact.conf         # METAR 落盘配置
 ├── requirements.txt       # Python 依赖
 ├── .env.example           # 环境变量模板
 ├── DEPLOY_NOTES.md        # 部署备忘与首次部署清单
@@ -81,8 +84,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 接口：
 
 - `GET /api/v1/metar?icao={ICAO_CODE}` —— 获取择优后的最终 METAR
-- `GET /api/v1/metar/sources?icao={ICAO_CODE}` —— 获取两个数据源的最新原始记录及当前 winner
-- `GET /api/v1/metar/sources/history?icao={ICAO_CODE}&hours={N}` —— 按时间窗口查询历史双源对比（支持 `start`/`end`）
+- `GET /api/v1/metar/sources?icao={ICAO_CODE}` —— 获取三个数据源的最新原始记录及当前 winner
+- `GET /api/v1/metar/sources/history?icao={ICAO_CODE}&hours={N}` —— 按时间窗口查询历史三源对比（支持 `start`/`end`）
 - `GET /api/v1/metar/stream?icaos={ICAO1,ICAO2}` —— SSE 实时流：推送 snapshot + 新 METAR 事件
 - `POST /api/v1/metar/batch` —— 批量获取温度解析结果
 - `GET /health` —— 健康检查
@@ -106,8 +109,11 @@ curl -N "http://127.0.0.1:8000/api/v1/metar/stream?icaos=KSEA,KJFK&heartbeat=5"
 ## Docker 本地运行
 
 ```bash
-# 构建并启动
+# 构建并启动（默认不启用 IEM LDM；LDM 需要 VPS IP 已在 IEM 白名单）
 docker compose up -d --build
+
+# 只启动 web + redis（不启动 m2-ldm）
+docker compose up -d --build web redis
 
 # 查看日志
 docker compose logs -f web
@@ -130,6 +136,9 @@ docker compose down
 | `WEATHERGOV_TOKEN` | 空 | 可选 SynopticData 独立 Token |
 | `HTTP_TIMEOUT` | `15.0` | HTTP 请求超时 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+| `IEM_LDM_ENABLED` | `false` | 是否启用 IEM LDM 采集（仅在已加入 IEM 白名单的 VPS IP 上有效） |
+| `IEM_LDM_FILE_PATH` | `/app/ldm_data/metar/metars.txt` | LDM METAR 文件在 M2 容器内路径 |
+| `IEM_LDM_TRUNCATE_INTERVAL_HOURS` | `1` | METAR 文件截断清理间隔（小时） |
 
 ## 生产部署
 
@@ -187,6 +196,12 @@ curl -i "http://47.251.25.183/api/v1/metar?icao=VHHH"
 HASH=$(curl -fsS "http://47.251.25.183/api/v1/metar?icao=VHHH" | python3 -c 'import sys,json; print(json.load(sys.stdin)["hash"])')
 curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.251.25.183/api/v1/metar?icao=VHHH"
 # 期望输出：304
+
+# IEM LDM 验证（如已在 .env 中启用）
+docker compose logs -f m2-ldm
+docker compose exec m2-ldm ls -l /home/ldm/var/data/metar/metars.txt
+curl -i "http://47.251.25.183/api/v1/metar/sources?icao=VHHH"
+# 应返回包含 weathergov / awc / iem 三个源的结构
 ```
 
 ## Redis Key 设计
@@ -196,8 +211,10 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 | `metar:{icao}` | String (JSON) | 择优后的最终 METAR 记录，API 返回此记录 |
 | `metar:{icao}:source:weathergov` | String (JSON) | weather.gov / SynopticData 最新原始记录 |
 | `metar:{icao}:source:awc` | String (JSON) | AviationWeather.gov 最新原始记录 |
+| `metar:{icao}:source:iem` | String (JSON) | IEM LDM 最新原始记录 |
 | `history:metar:{icao}:source:weathergov` | Sorted Set (JSON) | weather.gov 历史记录，score 为 observed_at 时间戳 |
 | `history:metar:{icao}:source:awc` | Sorted Set (JSON) | AWC 历史记录，score 为 observed_at 时间戳 |
+| `history:metar:{icao}:source:iem` | Sorted Set (JSON) | IEM LDM 历史记录，score 为 observed_at 时间戳 |
 
 所有 Key 强制 TTL = `METAR_TTL_SECONDS`（默认 7200 秒），防止采集器崩溃时客户端读到陈旧数据。
 历史 Sorted Set 默认保留 7 天，并自动清理过期数据。
@@ -206,9 +223,10 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 
 每轮轮询（默认 1 秒）执行：
 
-1. **并发双源批量请求**
-   - weather.gov：请求全部监控机场
-   - AWC：请求全部监控机场；`AUTO` 报文保留；`UUWW / LTFM / LLBG` 的 `SPECI` 报文跳过
+1. **并发三源采集**
+   - weather.gov：HTTP 批量请求全部监控机场
+   - AWC：HTTP 批量请求全部监控机场；`AUTO` 报文保留；`UUWW / LTFM / LLBG` 的 `SPECI` 报文跳过
+   - IEM LDM：本地文件增量读取，解析 GTS METAR/SPECI bulletin
 2. **分别写入 source-specific Key**
    - 仅当该数据源的 METAR 文本 hash 变化时才写入，避免无意义刷新
 3. **追加到历史记录**
@@ -216,12 +234,14 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
    - 以 `observed_at` 时间戳作为 score，便于按时间窗口查询
    - 自动清理超过 7 天的旧记录
 4. **逐机场择优**
-   - 比较 `metar:{icao}:source:weathergov` 与 `metar:{icao}:source:awc`
+   - 比较 `metar:{icao}:source:weathergov`、`metar:{icao}:source:awc` 与 `metar:{icao}:source:iem`
    - 优先选择 `observed_at` 更晚的记录（更新鲜）
    - 若 `observed_at` 相同，选择延迟 `updated_at - observed_at` 更小的记录
-   - 若仍相同，默认选择 weather.gov
+   - 若仍相同，默认选择 weather.gov > AWC > IEM
 5. **写入最终 Key**
    - 若择优结果 hash 变化，覆盖 `metar:{icao}`
+6. **LDM 文件清理**
+   - 按 `IEM_LDM_TRUNCATE_INTERVAL_HOURS` 周期清空 LDM 文件，防止磁盘无限增长
 
 ## SSE 实时推送
 
@@ -229,7 +249,7 @@ curl -fsS -o /dev/null -w '%{http_code}' -H "If-None-Match: $HASH" "http://47.25
 
 - 连接建立后先发送一次 `snapshot` 事件，包含当前所有请求机场的择优 METAR。
 - 之后每当 M2 采集到新的 METAR 数据，会实时推送以下事件：
-  - `source_update`：某个数据源（AWC / weather.gov）有新数据
+  - `source_update`：某个数据源（AWC / weather.gov / IEM LDM）有新数据
   - `winner_update`：M2 择优后的最终 METAR 发生变化
   - `correction`：官方修正事件（同一 observed_at 出现不同 hash）
 - 每 20 秒发送一次 heartbeat 注释保持连接。
@@ -360,7 +380,7 @@ while True:
 
 `GET /api/v1/metar/sources/history?icao={ICAO}&hours={N}`
 
-返回指定机场过去 N 小时内每条 METAR 在两个数据源中的发现时间及 winner：
+返回指定机场过去 N 小时内每条 METAR 在三个数据源中的发现时间及 winner：
 
 ```json
 {
@@ -395,6 +415,14 @@ GET /api/v1/metar/sources/history?icao=KORD&start=2026-07-10T00:00:00Z&end=2026-
   - API URL: `https://api.synopticdata.com/v2/stations/timeseries`
   - Token：优先使用 `WEATHERGOV_TOKEN`；未配置时从 `https://www.weather.gov/source/wrh/apiKey.js` 抓取内嵌 Token。
   - 必须过滤 `metar_origin_set_1 == 1` 才得到真正 METAR/SPECI。
+
+- **IEM LDM (GTS METAR/SPECI 推送)**：
+  - 上游：`mesonet-ah.agron.iastate.edu`（需 IP 白名单）
+  - 协议：Unidata LDM，出站 TCP 388
+  - 数据：原始 GTS `SA` / `SP` bulletin，由 LDM 容器写入本地文件，M2 增量读取
+  - 解析：跳过 WMO 报头，提取所有 `(METAR|SPECI) AAAA ddHHMMZ` 报文；一个 bulletin 可含多个机场
+  - 清理：M2 按 `IEM_LDM_TRUNCATE_INTERVAL_HOURS` 周期清空文件，防止磁盘无限增长
+  - 注意：IEM 上游采用 IP 白名单，因此 LDM 容器**只能在已加入白名单的 VPS 上有效工作**
 
 ## 外部项目集成
 

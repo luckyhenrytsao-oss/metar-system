@@ -37,6 +37,9 @@ services:
       - PYTHONUNBUFFERED=1
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      # 挂载 LDM 写入的 METAR 文件，供 M2 采集器读取
+      - ./m2-ldm/data:/app/ldm_data:ro
     networks:
       - metar-net
     healthcheck:
@@ -45,6 +48,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  m2-ldm:
+    image: unidata/ldm-docker:latest
+    container_name: m2-ldm
+    restart: unless-stopped
+    hostname: m2-ldm
+    environment:
+      # LDM 容器内以 UID/GID=1000 运行，宿主机目录需对该用户可写
+      - LDM_USER_ID=1000
+      - LDM_GROUP_ID=1000
+    volumes:
+      - ./m2-ldm/ldmd.conf:/home/ldm/etc/ldmd.conf
+      - ./m2-ldm/pqact.conf:/home/ldm/etc/pqact.conf
+      - ./m2-ldm/data:/home/ldm/var/data
+      - ./m2-ldm/logs:/home/ldm/var/logs
+      - ./m2-ldm/queues:/home/ldm/var/queues
+    networks:
+      - metar-net
 
 networks:
   metar-net:

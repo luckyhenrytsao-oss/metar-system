@@ -123,7 +123,7 @@ async def get_metar_sources(
     settings: Settings = Depends(get_settings),
     redis_client: Any = Depends(_get_redis_dependency),
 ):
-    """获取指定机场两个数据源各自的原始 METAR 记录以及当前择优后的最终记录.
+    """获取指定机场三个数据源各自的原始 METAR 记录以及当前择优后的最终记录.
 
     - 若 ICAO 不在监控列表，返回 404
     - 返回结构:
@@ -131,7 +131,8 @@ async def get_metar_sources(
             "icao": "KSEA",
             "winner": { ... },
             "weathergov": { ... } | null,
-            "awc": { ... } | null
+            "awc": { ... } | null,
+            "iem": { ... } | null
         }
     """
     icao = icao.upper()
@@ -145,6 +146,7 @@ async def get_metar_sources(
     winner = await get_metar(redis_client, icao)
     weathergov = await get_source_metar(redis_client, icao, "weathergov")
     awc = await get_source_metar(redis_client, icao, "awc")
+    iem = await get_source_metar(redis_client, icao, "iem")
 
     return JSONResponse(
         content={
@@ -152,6 +154,7 @@ async def get_metar_sources(
             "winner": winner,
             "weathergov": weathergov,
             "awc": awc,
+            "iem": iem,
         }
     )
 
@@ -165,14 +168,14 @@ async def get_metar_sources_history(
     settings: Settings = Depends(get_settings),
     redis_client: Any = Depends(_get_redis_dependency),
 ):
-    """获取指定机场在一段时间内多条 METAR 的双源速度对比历史.
+    """获取指定机场在一段时间内多条 METAR 的三源速度对比历史.
 
     支持两种参数组合：
       - icao + hours：查询过去 hours 小时
       - icao + start + [end]：查询指定时间窗口
 
     返回按 observed_at 降序排列的记录数组，每条记录包含该 METAR
-    在 AWC 与 weather.gov 中的发现时间及当前 M2 采用的 winner。
+    在 weather.gov、AWC 与 IEM LDM 中的发现时间及当前 M2 采用的 winner。
     """
     icao = icao.upper()
 
@@ -217,9 +220,10 @@ async def get_metar_sources_history(
             detail="end 必须晚于 start",
         )
 
-    # 读取两个数据源的历史记录
+    # 读取三个数据源的历史记录
     weathergov_records = await get_source_history(redis_client, icao, "weathergov", start_dt, end_dt)
     awc_records = await get_source_history(redis_client, icao, "awc", start_dt, end_dt)
+    iem_records = await get_source_history(redis_client, icao, "iem", start_dt, end_dt)
 
     # 合并：按 observed_at 分组
     grouped: dict[str, dict[str, Any]] = {}
@@ -234,6 +238,7 @@ async def get_metar_sources_history(
                 "observed_at": obs,
                 "weathergov": None,
                 "awc": None,
+                "iem": None,
             },
         )
         # 补充 temperature_c
@@ -245,11 +250,13 @@ async def get_metar_sources_history(
         _group_record(r, "weathergov")
     for r in awc_records:
         _group_record(r, "awc")
+    for r in iem_records:
+        _group_record(r, "iem")
 
     # 为每个 observed_at 计算 winner
     records: list[dict[str, Any]] = []
     for obs, item in grouped.items():
-        winner = _select_history_winner(item["weathergov"], item["awc"])
+        winner = _select_history_winner(item["weathergov"], item["awc"], item["iem"])
         item["winner"] = winner
         records.append(item)
 
@@ -268,29 +275,31 @@ async def get_metar_sources_history(
 def _select_history_winner(
     weathergov_record: Optional[dict[str, Any]],
     awc_record: Optional[dict[str, Any]],
+    iem_record: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """从历史记录的两个数据源条目中选出优胜者.
+    """从历史记录的三个数据源条目中选出优胜者.
 
     规则与采集器一致：observed_at 更晚优先；相同时延迟更低优先；
-    还相同则默认 weather.gov。history 接口中同一 observed_at 分组内
-    observed_at 必然相同，因此实际比较延迟。
+    还相同则默认优先顺序 weather.gov > AWC > IEM。history 接口中同一
+    observed_at 分组内 observed_at 必然相同，因此实际比较延迟。
     """
-    if weathergov_record is None:
-        return awc_record
-    if awc_record is None:
-        return weathergov_record
+    records = [weathergov_record, awc_record, iem_record]
+    records = [r for r in records if r is not None]
+    if not records:
+        return None
 
-    wg_updated = parse_iso(weathergov_record.get("updated_at"))
-    awc_updated = parse_iso(awc_record.get("updated_at"))
+    _SOURCE_PREF = {"weathergov": 0, "awc": 1, "iem": 2}
 
-    if wg_updated is None:
-        return awc_record
-    if awc_updated is None:
-        return weathergov_record
+    def _key(record: dict[str, Any]) -> tuple[int, float, int]:
+        updated = parse_iso(record.get("updated_at"))
+        latency = float("inf")
+        obs = parse_iso(record.get("observed_at"))
+        if obs is not None and updated is not None:
+            latency = (updated - obs).total_seconds()
+        source_pref = _SOURCE_PREF.get(record.get("source_key"), 99)
+        return (latency, source_pref)
 
-    if awc_updated < wg_updated:
-        return awc_record
-    return weathergov_record
+    return min(records, key=_key)
 
 
 @app.get("/api/v1/metar/corrections")

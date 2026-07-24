@@ -10,11 +10,14 @@ import respx
 from httpx import Response
 
 from app.collector import (
+    _IemLdmReader,
     _fetch_airport,
     _fetch_awc_batch,
+    _fetch_iem_batch,
     _fetch_weathergov_batch,
     _has_precision_temp,
     _merge_and_store_winners,
+    _parse_iem_bulletins,
     _parse_metar_time,
     _select_winner,
     _store_source_if_changed,
@@ -657,3 +660,177 @@ async def test_fetch_weathergov_batch_uses_raw_ob_time_not_date_time(
 
     assert "VHHH" in results
     assert results["VHHH"]["observed_at"] == "2026-07-05T04:30:00+00:00"
+
+
+class TestIemLdmReader:
+    """测试 IEM LDM 文件读取器."""
+
+    def test_read_new_returns_appended_content(self, tmp_path):
+        """读取追加的新内容并维护 offset."""
+        file_path = tmp_path / "metars.txt"
+        reader = _IemLdmReader(file_path)
+
+        assert reader.read_new() == ""
+
+        file_path.write_text(
+            "SAXX99 KWBC 240200\nMETAR KSEA 240153Z ...=",
+            encoding="utf-8",
+            newline="\n",
+        )
+        assert reader.read_new() == "SAXX99 KWBC 240200\nMETAR KSEA 240153Z ...="
+
+        # 模拟 LDM 追加写入（注意：write_text 会截断，不能用来模拟追加）
+        with open(file_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write("SAXX99 KWBC 240300\nMETAR KSEA 240253Z ...=")
+        assert reader.read_new() == "SAXX99 KWBC 240300\nMETAR KSEA 240253Z ...="
+
+    def test_read_new_resets_on_rotation(self, tmp_path):
+        """文件被替换（inode 变化）后从头读取."""
+        file_path = tmp_path / "metars.txt"
+        file_path.write_text("old content", encoding="utf-8")
+        reader = _IemLdmReader(file_path)
+        reader.read_new()
+
+        # 模拟轮转：删除旧文件，创建新文件
+        file_path.unlink()
+        file_path.write_text("new content", encoding="utf-8")
+
+        assert reader.read_new() == "new content"
+
+    def test_truncate_clears_file(self, tmp_path):
+        """truncate 清空文件并重置 offset."""
+        file_path = tmp_path / "metars.txt"
+        file_path.write_text("some content", encoding="utf-8")
+        reader = _IemLdmReader(file_path)
+        reader.read_new()
+
+        reader.truncate()
+        assert file_path.read_text(encoding="utf-8") == ""
+        assert reader._last_offset == 0
+
+
+def test_parse_iem_bulletins_single_airport():
+    """解析单个机场的 IEM bulletin."""
+    text = "SAXX99 KWBC 240200\nMETAR KSEA 240153Z 22007KT 10SM FEW050 23/14 A3003 RMK AO2 T02280144="
+    results = _parse_iem_bulletins(text, {"KSEA"})
+
+    assert "KSEA" in results
+    assert results["KSEA"]["icao"] == "KSEA"
+    assert "METAR KSEA 240153Z" in results["KSEA"]["raw_text"]
+    assert results["KSEA"]["source_key"] == "iem"
+    assert results["KSEA"]["source"] == "IEM LDM"
+
+
+def test_parse_iem_bulletins_multi_airport():
+    """解析包含多个机场的 IEM bulletin."""
+    text = (
+        "SAXX99 KWBC 240200\n"
+        "METAR KSEA 240153Z 22007KT 10SM 23/14 A3003 RMK AO2 T02280144 "
+        "METAR KPAE 240153Z 24005KT 10SM 22/13 A3002 RMK AO2 T02200130="
+    )
+    results = _parse_iem_bulletins(text, {"KSEA", "KPAE"})
+
+    assert set(results.keys()) == {"KSEA", "KPAE"}
+    assert "METAR KSEA 240153Z" in results["KSEA"]["raw_text"]
+    assert "METAR KPAE 240153Z" in results["KPAE"]["raw_text"]
+
+
+def test_parse_iem_bulletins_skips_header_stations():
+    """解析时跳过 GTS 报头中的集合中心代码，只取 METAR/SPECI 主体."""
+    text = "SAXX99 KWBC 240200\nMETAR KSEA 240153Z 22007KT 10SM 23/14 A3003="
+    results = _parse_iem_bulletins(text, {"KWBC", "KSEA"})
+
+    # KWBC 是报头，不应被识别为机场
+    assert "KWBC" not in results
+    assert "KSEA" in results
+
+
+def test_parse_iem_bulletins_prefers_later_observed_at():
+    """同一机场在同一批数据中有多个报告时保留 observed_at 最新的."""
+    text = (
+        "SAXX99 KWBC 240200\n"
+        "METAR KSEA 240153Z 22007KT 10SM 23/14 A3003 "
+        "METAR KSEA 240200Z 23008KT 10SM 24/15 A3001="
+    )
+    results = _parse_iem_bulletins(text, {"KSEA"})
+
+    # 240200Z 比 240153Z 晚，应保留 240200Z 这条
+    assert "240200Z" in results["KSEA"]["raw_text"]
+    assert "240153Z" not in results["KSEA"]["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_iem_batch_returns_empty_when_disabled(test_settings):
+    """LDM 未启用时返回空字典."""
+    test_settings.iem_ldm_enabled = False
+    results = await _fetch_iem_batch(["KSEA"], test_settings)
+    assert results == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_iem_batch_reads_file(tmp_path, test_settings, monkeypatch):
+    """LDM 启用时从文件读取并解析."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+    )
+
+    file_path = tmp_path / "metars.txt"
+    file_path.write_text(
+        "SAXX99 KWBC 240200\nMETAR KSEA 240153Z 22007KT 10SM 23/14 A3003 RMK AO2 T02280144=",
+        encoding="utf-8",
+    )
+
+    test_settings.iem_ldm_enabled = True
+    test_settings.iem_ldm_file_path = str(file_path)
+
+    results = await _fetch_iem_batch(["KSEA"], test_settings)
+
+    assert "KSEA" in results
+    assert results["KSEA"]["source_key"] == "iem"
+
+
+def test_select_winner_prefers_iem_when_latest():
+    """三个数据源中 IEM observed_at 最新时胜出."""
+    weathergov_record = {
+        "icao": "KSEA",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:59:15+00:00",
+        "source_key": "weathergov",
+    }
+    awc_record = {
+        "icao": "KSEA",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:55:00+00:00",
+        "source_key": "awc",
+    }
+    iem_record = {
+        "icao": "KSEA",
+        "observed_at": "2026-07-10T10:54:00+00:00",
+        "updated_at": "2026-07-10T10:54:05+00:00",
+        "source_key": "iem",
+    }
+
+    winner = _select_winner(weathergov_record, awc_record, iem_record)
+    assert winner["source_key"] == "iem"
+
+
+def test_select_winner_falls_back_when_iem_missing():
+    """IEM 缺失时仍能从 weathergov/awc 中正常选择."""
+    weathergov_record = {
+        "icao": "KSEA",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:59:15+00:00",
+        "source_key": "weathergov",
+    }
+    awc_record = {
+        "icao": "KSEA",
+        "observed_at": "2026-07-10T10:53:00+00:00",
+        "updated_at": "2026-07-10T10:55:00+00:00",
+        "source_key": "awc",
+    }
+
+    winner = _select_winner(weathergov_record, awc_record)
+    assert winner["source_key"] == "awc"

@@ -36,14 +36,18 @@
 
 ## 当前架构要点（已落地）
 
-1. **双源独立采集**：weather.gov 与 AWC 每轮各自批量请求全部监控机场。
+1. **三源独立采集**：
+   - weather.gov 与 AWC：每轮各自批量 HTTP 请求全部监控机场。
+   - IEM LDM：VPS 上部署 LDM 下游客户端，接收 GTS `SA`/`SP` bulletin 写入本地文件，M2 增量读取。
 2. **AWC 黑名单**：`UUWW` 不请求 AWC，但仍请求 weather.gov。
-3. **择优合并**：按 `observed_at` 最新 -> 延迟最小 -> weather.gov 默认，写入 `metar:{icao}`。
+3. **择优合并**：按 `observed_at` 最新 -> 延迟最小 -> weather.gov > AWC > IEM，写入 `metar:{icao}`。
 4. **source-specific 存储**：
    - `metar:{icao}:source:weathergov`
    - `metar:{icao}:source:awc`
+   - `metar:{icao}:source:iem`
 5. **METAR 时间统一**：从 `rawOb` 的 `ddHHMMZ` 解析 `observed_at`。
 6. **轮询间隔**：`POLL_INTERVAL_SECONDS=1.0`（高频）。
+7. **LDM 文件清理**：按 `IEM_LDM_TRUNCATE_INTERVAL_HOURS` 周期清空文件，默认 1 小时。
 
 ## 验证命令
 
@@ -73,6 +77,7 @@ curl http://127.0.0.1:8000/health
 | 2026-07-10 | 双源独立采集 + source-specific Key + 择优合并 | `23b8e85` |
 | 2026-07-13 | 新增 METAR 官方修正事件检测与 `/api/v1/metar/corrections` 接口 | `9608d59` |
 | 2026-07-14 | 修复 Nginx 配置：80 端口保留 IP 访问 M2 API，443 端口托管 dabolo.org Dashboard | - |
+| 2026-07-24 | 新增 IEM LDM 作为第三数据源，三源择优合并；LDM 文件按小时清理 | - |
 
 ## 可选但推荐
 
