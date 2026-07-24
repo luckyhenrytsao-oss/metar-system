@@ -9,6 +9,7 @@ import pytest
 import respx
 from httpx import Response
 
+from app import collector as collector_module
 from app.collector import (
     _IemLdmReader,
     _fetch_airport,
@@ -869,3 +870,61 @@ def test_select_winner_falls_back_when_iem_missing():
 
     winner = _select_winner(weathergov_record, awc_record)
     assert winner["source_key"] == "awc"
+
+
+def test_parse_iem_bulletins_multiline_same_read():
+    """同一批读取中包含多行 METAR 时，应把续行拼接后解析出完整报文."""
+    text = (
+        "SAXX99 KWBC 241351Z\n"
+        "KORD 241351Z 20003KT 10SM SCT065 BKN200 OVC250 21/11 A3017 RMK AO2\n"
+        "     SLP213 VIRGA SW T02110111 $="
+    )
+    results = _parse_iem_bulletins(text, {"KORD"})
+
+    assert "KORD" in results
+    assert "T02110111" in results["KORD"]["raw_text"]
+    assert "SLP213" in results["KORD"]["raw_text"]
+    # 多行续行前的换行应被转换为空格，不再保留在 raw_text 中
+    assert "\n" not in results["KORD"]["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_iem_batch_buffers_incomplete_bulletin(
+    tmp_path, test_settings, monkeypatch
+):
+    """LDM 分两次写入多行 METAR 时，应在第二次读取拼接完整后才解析."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 24, 13, 55, tzinfo=timezone.utc),
+    )
+
+    # 重置全局 IEM 读取器与缓冲区，避免其他测试的状态污染
+    collector_module._iem_ldm_reader = None
+    collector_module._iem_ldm_parse_buffer = ""
+
+    file_path = tmp_path / "metars.txt"
+    test_settings.iem_ldm_enabled = True
+    test_settings.iem_ldm_file_path = str(file_path)
+
+    # 第一次只写入第一行， bulletin 尚未以 ``=`` 结尾
+    file_path.write_text(
+        "SAXX99 KWBC 241351Z\n"
+        "KORD 241351Z 20003KT 10SM SCT065 BKN200 OVC250 21/11 A3017 RMK AO2\n",
+        encoding="utf-8",
+    )
+
+    results = await _fetch_iem_batch(["KORD"], test_settings)
+    # 没有完整 bulletin，不应返回结果；内容应被缓冲
+    assert "KORD" not in results
+
+    # 追加第二行，完成 bulletin
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write("     SLP213 VIRGA SW T02110111 $=\n")
+
+    results = await _fetch_iem_batch(["KORD"], test_settings)
+    assert "KORD" in results
+    assert "T02110111" in results["KORD"]["raw_text"]
+    assert results["KORD"]["icao"] == "KORD"
+    assert results["KORD"]["source_key"] == "iem"

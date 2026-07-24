@@ -296,6 +296,13 @@ def _has_precision_temp(raw_text: str) -> bool:
     return bool(raw_text and re.search(r"\bT[01]\d{3}[01]\d{3}", raw_text))
 
 
+# IEM LDM 解析缓冲区：保存上次读取末尾未完整的 bulletin，下次读取时拼接
+_iem_ldm_parse_buffer: str = ""
+
+# IEM LDM 缓冲区大小上限（字节），防止异常情况下无限增长
+_IEM_LDM_MAX_BUFFER_SIZE = 1024 * 1024
+
+
 class _IemLdmReader:
     """IEM LDM METAR 文件读取器.
 
@@ -355,12 +362,17 @@ class _IemLdmReader:
 
 
 def _get_iem_ldm_reader(settings: Optional[Settings] = None) -> Optional[_IemLdmReader]:
-    """获取或创建 IEM LDM 文件读取器."""
+    """获取或创建 IEM LDM 文件读取器.
+
+    当配置文件路径发生变化时自动重建读取器，避免测试或配置切换时读到旧路径。
+    """
     global _iem_ldm_reader
-    if _iem_ldm_reader is None:
-        cfg = settings or get_settings()
-        if cfg.iem_ldm_enabled:
-            _iem_ldm_reader = _IemLdmReader(Path(cfg.iem_ldm_file_path))
+    cfg = settings or get_settings()
+    if not cfg.iem_ldm_enabled:
+        return None
+    target_path = Path(cfg.iem_ldm_file_path)
+    if _iem_ldm_reader is None or _iem_ldm_reader.file_path != target_path:
+        _iem_ldm_reader = _IemLdmReader(target_path)
     return _iem_ldm_reader
 
 
@@ -411,14 +423,19 @@ def _parse_iem_bulletins(
         if not bulletin:
             continue
 
-        # 去掉 WMO 报头行，只保留 METAR/SPECI 主体
+        # 去掉 WMO 报头行，只保留 METAR/SPECI 主体。
+        # 注意：只有 bulletin 的第一条非空行才可能是 WMO 报头；后续行（如 RMK 中的
+        # SLP213 续行）可能误匹配报头正则，必须保留。
         body_lines: list[str] = []
+        first_non_empty_line = True
         for line in bulletin.splitlines():
             line = line.strip()
             if not line:
                 continue
-            if _IEM_WMO_HEADER_RE.match(line):
+            if first_non_empty_line and _IEM_WMO_HEADER_RE.match(line):
+                first_non_empty_line = False
                 continue
+            first_non_empty_line = False
             body_lines.append(line)
 
         if not body_lines:
@@ -487,6 +504,8 @@ async def _fetch_iem_batch(
 
     - 未启用 LDM 时返回空字典
     - 文件不存在时记录 warning 并返回空字典（LDM 可能尚未启动或建立连接）
+    - 对跨多次读取的不完整 bulletin（未以 ``=`` 结尾）进行缓冲，下次读取时拼接完整后再解析，
+      避免多行 METAR 在只写入第一行时被截断解析。
     """
     cfg = settings or get_settings()
     if not cfg.iem_ldm_enabled:
@@ -501,7 +520,35 @@ async def _fetch_iem_batch(
     if not new_text:
         return {}
 
-    return _parse_iem_bulletins(new_text, requested_codes)
+    global _iem_ldm_parse_buffer
+
+    # 拼接上次残留的未完成 bulletin
+    combined = _iem_ldm_parse_buffer + new_text
+
+    # 安全上限：缓冲区过大时丢弃旧数据，防止内存无限增长
+    if len(combined.encode("utf-8")) > _IEM_LDM_MAX_BUFFER_SIZE:
+        logger.warning(
+            "IEM LDM parse buffer exceeded %d bytes, dropping old buffered content",
+            _IEM_LDM_MAX_BUFFER_SIZE,
+        )
+        _iem_ldm_parse_buffer = ""
+        combined = new_text
+
+    # GTS bulletin 以 ``=`` 结尾；若 combined 未以 ``=`` 结尾，说明最后一条不完整，需缓存
+    if combined.endswith("="):
+        _iem_ldm_parse_buffer = ""
+        return _parse_iem_bulletins(combined, requested_codes)
+
+    last_equal_pos = combined.rfind("=")
+    if last_equal_pos == -1:
+        # 完全没有完整 bulletin，全部缓存等待下次读取
+        _iem_ldm_parse_buffer = combined
+        return {}
+
+    # 缓存最后一个 ``=`` 之后的不完整尾部，解析前面完整的部分
+    _iem_ldm_parse_buffer = combined[last_equal_pos + 1 :]
+    complete_part = combined[: last_equal_pos + 1]
+    return _parse_iem_bulletins(complete_part, requested_codes)
 
 
 def _maybe_truncate_iem_file(settings: Optional[Settings] = None) -> None:
