@@ -748,6 +748,15 @@ def test_parse_iem_bulletins_skips_header_stations():
     assert "KSEA" in results
 
 
+def test_parse_iem_bulletins_no_metar_prefix():
+    """US 国内部分报文没有 METAR/SPECI 前缀，应能正确解析."""
+    text = "SAXX99 KWBC 240200\nKSEA 240153Z 22007KT 10SM 23/14 A3003 RMK AO2 T02280144="
+    results = _parse_iem_bulletins(text, {"KSEA"})
+
+    assert "KSEA" in results
+    assert results["KSEA"]["raw_text"].startswith("KSEA 240153Z")
+
+
 def test_parse_iem_bulletins_prefers_later_observed_at():
     """同一机场在同一批数据中有多个报告时保留 observed_at 最新的."""
     text = (

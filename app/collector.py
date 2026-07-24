@@ -367,8 +367,10 @@ def _get_iem_ldm_reader(settings: Optional[Settings] = None) -> Optional[_IemLdm
 # GTS WMO 报头正则：如 "SAXX99 KWBC 240200"
 _IEM_WMO_HEADER_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{2}\d{2}\s+[A-Z]{4}")
 
-# 单条 METAR/SPECI 起始正则：METAR KSEA 240153Z 或 SPECI KSEA 240153Z
-_IEM_METAR_RE = re.compile(r"\b(METAR|SPECI)\s+([A-Z]{4})\s+(\d{6})Z\b")
+# 单条 METAR/SPECI 起始正则.
+# 注意：GTS bulletin 中 METAR/SPECI 前缀是可选的，例如 US 国内报文可能直接以
+# "KSEA 240953Z ..." 开头。因此正则让前缀可选，但仍要求 Z 结尾，避免匹配 WMO 报头。
+_IEM_METAR_RE = re.compile(r"(?:^|\s)(?:METAR|SPECI)?\s*([A-Z]{4})\s+(\d{6})Z\b")
 
 
 def _parse_iem_bulletins(
@@ -415,8 +417,7 @@ def _parse_iem_bulletins(
         # 提取当前 bulletin 内所有 METAR/SPECI 报文
         matches = list(_IEM_METAR_RE.finditer(body))
         for idx, match in enumerate(matches):
-            report_type = match.group(1)
-            icao = match.group(2)
+            icao = match.group(1)
 
             if icao not in requested_codes:
                 continue
