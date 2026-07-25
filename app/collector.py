@@ -126,23 +126,73 @@ def _parse_iso_time(value: str) -> Optional[datetime]:
 
 
 def _parse_metar_time(raw_metar: str, base_time: datetime) -> Optional[datetime]:
-    """从 METAR 文本的 DDHHMMZ 字段解析观测时间."""
+    """从 METAR 文本的 ddHHMMZ 字段解析观测时间.
+
+    ddHHMMZ 中的 dd 是明确的日期（日）。为了确定月份/年份，尝试当前月、上月、下月
+    三个候选，选取与 base_time 绝对差最小的那个。这样既尊重报文里的明确日期，
+    又能正确处理跨月边界（如 8 月 1 日收到 312350Z 应属于 7 月 31 日）。
+    """
     if not raw_metar:
         return None
     match = re.search(r"\b(\d{2})(\d{2})(\d{2})Z\b", raw_metar)
     if not match:
         return None
     day, hour, minute = map(int, match.groups())
-    dt = datetime(
-        base_time.year, base_time.month, day, hour, minute, tzinfo=timezone.utc
-    )
-    # 处理跨天/跨月边界
-    diff = (dt - base_time).total_seconds()
-    if diff > 43200:
-        dt -= timedelta(days=1)
-    elif diff < -43200:
-        dt += timedelta(days=1)
-    return dt
+
+    candidates: list[datetime] = []
+    for month_delta in (-1, 0, 1):
+        year = base_time.year
+        month = base_time.month + month_delta
+        # 规范化月份并相应调整年份
+        while month > 12:
+            month -= 12
+            year += 1
+        while month < 1:
+            month += 12
+            year -= 1
+        try:
+            candidates.append(
+                datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+            )
+        except ValueError:
+            # 该月没有这一天（如 2 月 30 日），跳过
+            continue
+
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda dt: abs((dt - base_time).total_seconds()))
+
+
+def _is_observed_at_valid(
+    obs_time: datetime,
+    settings: Optional[Settings] = None,
+) -> bool:
+    """校验 METAR 观测时间是否在可接受的新鲜度窗口内.
+
+    - 未来超过 metar_max_future_seconds 的丢弃（防止跨天修正或上游异常）
+    - 过去超过 metar_max_age_seconds 的丢弃（防止重放陈旧数据）
+    """
+    cfg = settings or get_settings()
+    now = _now_utc()
+    max_future = timedelta(seconds=cfg.metar_max_future_seconds)
+    max_age = timedelta(seconds=cfg.metar_max_age_seconds)
+
+    if obs_time > now + max_future:
+        logger.warning(
+            "METAR observed_at %s is more than %ds in the future, rejecting",
+            obs_time.isoformat(),
+            cfg.metar_max_future_seconds,
+        )
+        return False
+    if obs_time < now - max_age:
+        logger.warning(
+            "METAR observed_at %s is older than %ds, rejecting",
+            obs_time.isoformat(),
+            cfg.metar_max_age_seconds,
+        )
+        return False
+    return True
 
 
 def _is_metar_origin(value: Any) -> bool:
@@ -158,8 +208,10 @@ def _is_metar_origin(value: Any) -> bool:
 def _extract_weathergov_metars(
     data: dict[str, Any],
     requested_codes: set[str],
+    settings: Optional[Settings] = None,
 ) -> dict[str, dict[str, Any]]:
     """从 SynopticData 响应中提取每个请求机场的最新真实 METAR."""
+    cfg = settings or get_settings()
     results: dict[str, dict[str, Any]] = {}
     stations = data.get("STATION") or []
     if isinstance(stations, dict):
@@ -214,6 +266,14 @@ def _extract_weathergov_metars(
         if obs_time is None:
             logger.warning(
                 "Could not parse METAR time from rawOb for %s: %s", code, raw_metar[:80]
+            )
+            continue
+
+        if not _is_observed_at_valid(obs_time, cfg):
+            logger.warning(
+                "weather.gov METAR for %s rejected due to invalid observed_at: %s",
+                code,
+                raw_metar[:80],
             )
             continue
 
@@ -279,7 +339,7 @@ async def _fetch_weathergov_batch(
             return {}
         resp.raise_for_status()
         data = resp.json()
-        return _extract_weathergov_metars(data, requested_codes)
+        return _extract_weathergov_metars(data, requested_codes, cfg)
     except httpx.HTTPError as exc:
         logger.error("weather.gov batch fetch error: %s", exc)
     except json.JSONDecodeError as exc:
@@ -400,16 +460,20 @@ def _is_iem_speci_filtered(icao: str, raw_text: str) -> bool:
 def _parse_iem_bulletins(
     text: str,
     requested_codes: set[str],
+    settings: Optional[Settings] = None,
 ) -> dict[str, dict[str, Any]]:
     """解析 IEM LDM 推送的 GTS bulletin 文本.
 
     - 按 "=" 分隔 bulletin
     - 跳过 WMO 报头行
     - 从每个 bulletin 中提取所有 METAR/SPECI 报文
+    - 丢弃 observed_at 超出新鲜度窗口的报文
     - 对每个机场保留 observed_at 最新的一条；时间相同时优先保留含 RMK+T 的
     """
     if not text:
         return {}
+
+    cfg = settings or get_settings()
 
     # 去掉控制字符，避免解析异常
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -467,6 +531,14 @@ def _parse_iem_bulletins(
             if obs_time is None:
                 logger.warning(
                     "Could not parse METAR time from IEM bulletin for %s: %s",
+                    icao,
+                    raw_text[:80],
+                )
+                continue
+
+            if not _is_observed_at_valid(obs_time, cfg):
+                logger.warning(
+                    "IEM METAR for %s rejected due to invalid observed_at: %s",
                     icao,
                     raw_text[:80],
                 )
@@ -548,7 +620,7 @@ async def _fetch_iem_batch(
     # 缓存最后一个 ``=`` 之后的不完整尾部，解析前面完整的部分
     _iem_ldm_parse_buffer = combined[last_equal_pos + 1 :]
     complete_part = combined[: last_equal_pos + 1]
-    return _parse_iem_bulletins(complete_part, requested_codes)
+    return _parse_iem_bulletins(complete_part, requested_codes, cfg)
 
 
 def _maybe_truncate_iem_file(settings: Optional[Settings] = None) -> None:
@@ -677,6 +749,14 @@ async def _fetch_awc_batch(
             if obs_time is None:
                 logger.warning(
                     "Could not parse METAR time from rawOb for %s: %s",
+                    icao,
+                    chosen_raw[:80],
+                )
+                continue
+
+            if not _is_observed_at_valid(obs_time, cfg):
+                logger.warning(
+                    "AWC METAR for %s rejected due to invalid observed_at: %s",
                     icao,
                     chosen_raw[:80],
                 )

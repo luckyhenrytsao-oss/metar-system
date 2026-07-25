@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import respx
@@ -17,6 +17,7 @@ from app.collector import (
     _fetch_iem_batch,
     _fetch_weathergov_batch,
     _has_precision_temp,
+    _is_observed_at_valid,
     _merge_and_store_winners,
     _parse_iem_bulletins,
     _parse_metar_time,
@@ -33,6 +34,23 @@ def reset_http_client():
     """每个测试用例结束后关闭 HTTP 客户端，避免状态污染."""
     yield
     asyncio.run(close_http_client())
+
+
+@pytest.fixture
+def mock_now_july_5_2026(monkeypatch) -> None:
+    """把当前 UTC 时间固定到 2026-07-05 04:55，匹配 fixture 中测试数据的日期."""
+    monkeypatch.setattr(
+        "app.collector._now_utc",
+        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+    )
+
+
+@pytest.fixture
+def relaxed_settings(test_settings) -> Settings:
+    """返回一个最大年龄/未来窗口都很宽松的 settings，用于解析类单元测试."""
+    test_settings.metar_max_age_seconds = 86400 * 30
+    test_settings.metar_max_future_seconds = 86400 * 30
+    return test_settings
 
 
 @pytest.fixture
@@ -117,7 +135,9 @@ def sample_weathergov_non_metar_response():
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_success(fake_redis, test_settings, sample_awc_response):
+async def test_fetch_awc_batch_success(
+    fake_redis, test_settings, sample_awc_response, mock_now_july_5_2026
+):
     """测试从 AWC 批量获取多个机场 METAR."""
     with respx.mock:
         route = respx.get("https://aviationweather.gov/api/data/metar").mock(
@@ -154,7 +174,9 @@ async def test_fetch_awc_batch_keeps_auto(
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_filters_speci_for_selected_stations(fake_redis, test_settings):
+async def test_fetch_awc_batch_filters_speci_for_selected_stations(
+    fake_redis, test_settings, mock_now_july_5_2026
+):
     """测试 UUWW / LTFM / LLBG 在 AWC 中跳过 SPECI，其他机场正常保留."""
     response = [
         {
@@ -193,7 +215,9 @@ async def test_fetch_awc_batch_filters_speci_for_selected_stations(fake_redis, t
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_disabled_for_uuww(fake_redis, test_settings):
+async def test_fetch_awc_batch_disabled_for_uuww(
+    fake_redis, test_settings, mock_now_july_5_2026
+):
     """UUWW 不再全局禁用 AWC；本测试保留以确认 AWC 请求正常发起."""
     with respx.mock:
         route = respx.get("https://aviationweather.gov/api/data/metar").mock(
@@ -208,7 +232,7 @@ async def test_fetch_awc_batch_disabled_for_uuww(fake_redis, test_settings):
 
 @pytest.mark.asyncio
 async def test_fetch_weathergov_batch_success(
-    fake_redis, test_settings, sample_weathergov_response
+    fake_redis, test_settings, sample_weathergov_response, mock_now_july_5_2026
 ):
     """测试从 weather.gov 批量获取 METAR."""
     test_settings.weathergov_token = "fake-token-for-test"
@@ -226,7 +250,7 @@ async def test_fetch_weathergov_batch_success(
 
 @pytest.mark.asyncio
 async def test_fetch_weathergov_filters_non_metar_origin(
-    fake_redis, test_settings, sample_weathergov_non_metar_response
+    fake_redis, test_settings, sample_weathergov_non_metar_response, mock_now_july_5_2026
 ):
     """测试 weather.gov 采集器过滤 ASOS/AWOS 自动观测，只保留真正 METAR."""
     test_settings.weathergov_token = "fake-token-for-test"
@@ -513,6 +537,55 @@ def test_parse_metar_time_cross_day():
     assert parsed.minute == 50
 
 
+def test_parse_metar_time_does_not_shift_stale_same_day():
+    """12 小时以上的陈旧同日报文不应被推到次日（EFHK 问题）."""
+    base = datetime(2026, 7, 24, 20, 59, tzinfo=timezone.utc)
+    raw = "EFHK 240850Z 21007KT 180V250 9999 SCT036TCU 19/11 Q1010 TEMPO SCT040"
+    parsed = _parse_metar_time(raw, base)
+    assert parsed is not None
+    assert parsed == datetime(2026, 7, 24, 8, 50, tzinfo=timezone.utc)
+
+
+def test_parse_metar_time_cross_month_boundary():
+    """跨月边界时，应把 312350Z 正确归到上月最后一天."""
+    base = datetime(2026, 8, 1, 0, 30, tzinfo=timezone.utc)
+    raw = "METAR KJFK 312350Z 24008KT 10SM FEW250 25/18 A3012 RMK AO2 T02500180"
+    parsed = _parse_metar_time(raw, base)
+    assert parsed is not None
+    assert parsed == datetime(2026, 7, 31, 23, 50, tzinfo=timezone.utc)
+
+
+def test_is_observed_at_valid_rejects_future(monkeypatch):
+    """未来超过 metar_max_future_seconds 的观测时间应被拒绝."""
+    from app.config import Settings
+
+    settings = Settings(
+        metar_max_age_seconds=7200,
+        metar_max_future_seconds=600,
+    )
+    now = datetime(2026, 7, 24, 20, 59, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.collector._now_utc", lambda: now)
+
+    assert _is_observed_at_valid(now, settings) is True
+    assert _is_observed_at_valid(now + timedelta(minutes=5), settings) is True
+    assert _is_observed_at_valid(now + timedelta(minutes=11), settings) is False
+
+
+def test_is_observed_at_valid_rejects_stale(monkeypatch):
+    """过去超过 metar_max_age_seconds 的观测时间应被拒绝."""
+    from app.config import Settings
+
+    settings = Settings(
+        metar_max_age_seconds=7200,
+        metar_max_future_seconds=600,
+    )
+    now = datetime(2026, 7, 24, 20, 59, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.collector._now_utc", lambda: now)
+
+    assert _is_observed_at_valid(now - timedelta(hours=1), settings) is True
+    assert _is_observed_at_valid(now - timedelta(hours=2, minutes=1), settings) is False
+
+
 def test_has_precision_temp_9_digit_group():
     """9 位 T 组（如 T017201444）也应识别为含精确温度组."""
     assert _has_precision_temp(
@@ -546,7 +619,9 @@ async def test_fetch_awc_handles_rate_limit(fake_redis, test_settings):
 
 
 @pytest.mark.asyncio
-async def test_fetch_awc_batch_skips_missing_metar_time(fake_redis, test_settings):
+async def test_fetch_awc_batch_skips_missing_metar_time(
+    fake_redis, test_settings, mock_now_july_5_2026
+):
     """测试 AWC 返回的 rawOb 没有 ddHHMMZ 时间组时跳过该条."""
     bad_response = [
         {
@@ -567,7 +642,7 @@ async def test_fetch_awc_batch_skips_missing_metar_time(fake_redis, test_setting
 
 @pytest.mark.asyncio
 async def test_fetch_weathergov_batch_skips_missing_metar_time(
-    fake_redis, test_settings
+    fake_redis, test_settings, mock_now_july_5_2026
 ):
     """测试 weather.gov 返回的 rawOb 没有 ddHHMMZ 时间组时跳过该条."""
     bad_response = {
@@ -713,10 +788,10 @@ class TestIemLdmReader:
         assert reader._last_offset == 0
 
 
-def test_parse_iem_bulletins_single_airport():
+def test_parse_iem_bulletins_single_airport(relaxed_settings):
     """解析单个机场的 IEM bulletin."""
     text = "SAXX99 KWBC 240200\nMETAR KSEA 240153Z 22007KT 10SM FEW050 23/14 A3003 RMK AO2 T02280144="
-    results = _parse_iem_bulletins(text, {"KSEA"})
+    results = _parse_iem_bulletins(text, {"KSEA"}, relaxed_settings)
 
     assert "KSEA" in results
     assert results["KSEA"]["icao"] == "KSEA"
@@ -725,70 +800,70 @@ def test_parse_iem_bulletins_single_airport():
     assert results["KSEA"]["source"] == "IEM LDM"
 
 
-def test_parse_iem_bulletins_multi_airport():
+def test_parse_iem_bulletins_multi_airport(relaxed_settings):
     """解析包含多个机场的 IEM bulletin."""
     text = (
         "SAXX99 KWBC 240200\n"
         "METAR KSEA 240153Z 22007KT 10SM 23/14 A3003 RMK AO2 T02280144 "
         "METAR KPAE 240153Z 24005KT 10SM 22/13 A3002 RMK AO2 T02200130="
     )
-    results = _parse_iem_bulletins(text, {"KSEA", "KPAE"})
+    results = _parse_iem_bulletins(text, {"KSEA", "KPAE"}, relaxed_settings)
 
     assert set(results.keys()) == {"KSEA", "KPAE"}
     assert "METAR KSEA 240153Z" in results["KSEA"]["raw_text"]
     assert "METAR KPAE 240153Z" in results["KPAE"]["raw_text"]
 
 
-def test_parse_iem_bulletins_skips_header_stations():
+def test_parse_iem_bulletins_skips_header_stations(relaxed_settings):
     """解析时跳过 GTS 报头中的集合中心代码，只取 METAR/SPECI 主体."""
     text = "SAXX99 KWBC 240200\nMETAR KSEA 240153Z 22007KT 10SM 23/14 A3003="
-    results = _parse_iem_bulletins(text, {"KWBC", "KSEA"})
+    results = _parse_iem_bulletins(text, {"KWBC", "KSEA"}, relaxed_settings)
 
     # KWBC 是报头，不应被识别为机场
     assert "KWBC" not in results
     assert "KSEA" in results
 
 
-def test_parse_iem_bulletins_no_metar_prefix():
+def test_parse_iem_bulletins_no_metar_prefix(relaxed_settings):
     """US 国内部分报文没有 METAR/SPECI 前缀，应能正确解析."""
     text = "SAXX99 KWBC 240200\nKSEA 240153Z 22007KT 10SM 23/14 A3003 RMK AO2 T02280144="
-    results = _parse_iem_bulletins(text, {"KSEA"})
+    results = _parse_iem_bulletins(text, {"KSEA"}, relaxed_settings)
 
     assert "KSEA" in results
     assert results["KSEA"]["raw_text"].startswith("KSEA 240153Z")
 
 
-def test_parse_iem_bulletins_filters_speci_for_uuww():
+def test_parse_iem_bulletins_filters_speci_for_uuww(relaxed_settings):
     """UUWW 的 IEM LDM SPECI 报文应被跳过，保留同一机场的 METAR."""
     text = (
         "SAXX99 KWBC 240200\n"
         "SPECI UUWW 240155Z 01003MPS CAVOK 21/12 Q1011 "
         "METAR UUWW 240130Z 01003MPS CAVOK 21/12 Q1011="
     )
-    results = _parse_iem_bulletins(text, {"UUWW"})
+    results = _parse_iem_bulletins(text, {"UUWW"}, relaxed_settings)
 
     assert "UUWW" in results
     assert "SPECI" not in results["UUWW"]["raw_text"]
     assert results["UUWW"]["raw_text"].startswith("METAR UUWW")
 
 
-def test_parse_iem_bulletins_keeps_speci_for_other_stations():
+def test_parse_iem_bulletins_keeps_speci_for_other_stations(relaxed_settings):
     """非过滤列表机场的 IEM LDM SPECI 报文正常保留."""
     text = "SAXX99 KWBC 240200\nSPECI KJFK 240155Z 24008KT 10SM 25/18 A3012="
-    results = _parse_iem_bulletins(text, {"KJFK"})
+    results = _parse_iem_bulletins(text, {"KJFK"}, relaxed_settings)
 
     assert "KJFK" in results
     assert results["KJFK"]["raw_text"].startswith("SPECI KJFK")
 
 
-def test_parse_iem_bulletins_prefers_later_observed_at():
+def test_parse_iem_bulletins_prefers_later_observed_at(relaxed_settings):
     """同一机场在同一批数据中有多个报告时保留 observed_at 最新的."""
     text = (
         "SAXX99 KWBC 240200\n"
         "METAR KSEA 240153Z 22007KT 10SM 23/14 A3003 "
         "METAR KSEA 240200Z 23008KT 10SM 24/15 A3001="
     )
-    results = _parse_iem_bulletins(text, {"KSEA"})
+    results = _parse_iem_bulletins(text, {"KSEA"}, relaxed_settings)
 
     # 240200Z 比 240153Z 晚，应保留 240200Z 这条
     assert "240200Z" in results["KSEA"]["raw_text"]
@@ -804,13 +879,15 @@ async def test_fetch_iem_batch_returns_empty_when_disabled(test_settings):
 
 
 @pytest.mark.asyncio
-async def test_fetch_iem_batch_reads_file(tmp_path, test_settings, monkeypatch):
+async def test_fetch_iem_batch_reads_file(
+    tmp_path, test_settings, relaxed_settings, monkeypatch
+):
     """LDM 启用时从文件读取并解析."""
     from datetime import datetime, timezone
 
     monkeypatch.setattr(
         "app.collector._now_utc",
-        lambda: datetime(2026, 7, 5, 4, 55, tzinfo=timezone.utc),
+        lambda: datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc),
     )
 
     file_path = tmp_path / "metars.txt"
@@ -819,10 +896,10 @@ async def test_fetch_iem_batch_reads_file(tmp_path, test_settings, monkeypatch):
         encoding="utf-8",
     )
 
-    test_settings.iem_ldm_enabled = True
-    test_settings.iem_ldm_file_path = str(file_path)
+    relaxed_settings.iem_ldm_enabled = True
+    relaxed_settings.iem_ldm_file_path = str(file_path)
 
-    results = await _fetch_iem_batch(["KSEA"], test_settings)
+    results = await _fetch_iem_batch(["KSEA"], relaxed_settings)
 
     assert "KSEA" in results
     assert results["KSEA"]["source_key"] == "iem"
@@ -872,14 +949,14 @@ def test_select_winner_falls_back_when_iem_missing():
     assert winner["source_key"] == "awc"
 
 
-def test_parse_iem_bulletins_multiline_same_read():
+def test_parse_iem_bulletins_multiline_same_read(relaxed_settings):
     """同一批读取中包含多行 METAR 时，应把续行拼接后解析出完整报文."""
     text = (
         "SAXX99 KWBC 241351Z\n"
         "KORD 241351Z 20003KT 10SM SCT065 BKN200 OVC250 21/11 A3017 RMK AO2\n"
         "     SLP213 VIRGA SW T02110111 $="
     )
-    results = _parse_iem_bulletins(text, {"KORD"})
+    results = _parse_iem_bulletins(text, {"KORD"}, relaxed_settings)
 
     assert "KORD" in results
     assert "T02110111" in results["KORD"]["raw_text"]

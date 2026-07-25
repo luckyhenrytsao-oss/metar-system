@@ -30,6 +30,8 @@ class Settings(BaseSettings):
       - poll_interval_seconds -> POLL_INTERVAL_SECONDS
       - user_agent -> USER_AGENT
       - metar_ttl_seconds -> METAR_TTL_SECONDS
+      - metar_max_age_seconds -> METAR_MAX_AGE_SECONDS
+      - metar_max_future_seconds -> METAR_MAX_FUTURE_SECONDS
       - weathergov_token -> WEATHERGOV_TOKEN
       - http_timeout -> HTTP_TIMEOUT
       - log_level -> LOG_LEVEL
@@ -89,6 +91,19 @@ class Settings(BaseSettings):
         default=7200,
         ge=60,
         description="METAR 数据在 Redis 中的 TTL（秒）",
+    )
+
+    # METAR 观测时间新鲜度窗口：过旧或未来的报文不进入 Redis
+    metar_max_age_seconds: int = Field(
+        default=7200,
+        ge=60,
+        description="允许接收的最陈旧 METAR 观测时间（秒），超过则丢弃",
+    )
+
+    metar_max_future_seconds: int = Field(
+        default=600,
+        ge=0,
+        description="允许接收的最超前 METAR 观测时间（秒），超过则丢弃",
     )
 
     # weather.gov / SynopticData 独立 Token（可选）
