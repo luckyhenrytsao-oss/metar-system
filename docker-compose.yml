@@ -38,8 +38,11 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      # 挂载 LDM 写入的 METAR 文件，供 M2 采集器读取
-      - ./m2-ldm/data:/app/ldm_data:ro
+      # 挂载 LDM 写入的 METAR 文件，供 M2 采集器读取和 truncate。
+      # 注意：不可使用 :ro，否则 M2 无法执行 _maybe_truncate_iem_file()，
+      # 会导致 metars.txt 无限增长。
+      # TODO: 后续改用 logrotate 对 LDM 文件做归档轮转，而不是由 M2 直接 truncate。
+      - ./m2-ldm/data:/app/ldm_data
     networks:
       - metar-net
     healthcheck:
