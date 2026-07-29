@@ -362,12 +362,17 @@ _iem_ldm_parse_buffer: str = ""
 # IEM LDM 缓冲区大小上限（字节），防止异常情况下无限增长
 _IEM_LDM_MAX_BUFFER_SIZE = 1024 * 1024
 
+# IEM LDM 单次最大读取字节数，防止 backlog 过大时一次性加载导致 OOM
+_IEM_LDM_MAX_READ_SIZE = 1024 * 1024
+
 
 class _IemLdmReader:
     """IEM LDM METAR 文件读取器.
 
     通过维护 inode 和 offset 实现增量读取；文件被轮转或清空时自动重置。
     支持按配置周期 truncate 文件，防止磁盘无限增长。
+    单次读取上限为 _IEM_LDM_MAX_READ_SIZE， backlog 过大时只读取最近数据，
+    避免启动时一次性加载几十 MB 导致内存耗尽。
     """
 
     def __init__(self, file_path: Path) -> None:
@@ -394,20 +399,31 @@ class _IemLdmReader:
         ):
             self._last_offset = 0
 
+        # 首次读取且文件过大时，跳过旧 backlog，只读最近 _IEM_LDM_MAX_READ_SIZE 字节
+        if self._last_inode is None and size > _IEM_LDM_MAX_READ_SIZE:
+            logger.warning(
+                "IEM LDM file is %d bytes on first read, skipping old backlog",
+                size,
+            )
+            self._last_offset = size - _IEM_LDM_MAX_READ_SIZE
+
         if size <= self._last_offset:
             self._last_inode = inode
             return ""
 
+        # 限制单次读取大小，避免大 backlog 导致内存尖峰
+        read_size = min(size - self._last_offset, _IEM_LDM_MAX_READ_SIZE)
+
         try:
             with open(self.file_path, "rb") as f:
                 f.seek(self._last_offset)
-                data = f.read(size - self._last_offset)
+                data = f.read(read_size)
         except OSError as exc:
             logger.warning("Failed to read IEM LDM file %s: %s", self.file_path, exc)
             return ""
 
         self._last_inode = inode
-        self._last_offset = size
+        self._last_offset = self._last_offset + read_size
         return data.decode("utf-8", errors="replace")
 
     def truncate(self) -> None:

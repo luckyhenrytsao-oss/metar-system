@@ -787,6 +787,24 @@ class TestIemLdmReader:
         assert file_path.read_text(encoding="utf-8") == ""
         assert reader._last_offset == 0
 
+    def test_read_new_skips_large_backlog_on_first_read(self, tmp_path):
+        """首次读取时文件过大，应跳过旧 backlog 并限制单次读取大小."""
+        file_path = tmp_path / "metars.txt"
+        # 构造 2MB 的填充内容，最后放一条有效 bulletin
+        padding = "x" * (2 * 1024 * 1024)
+        tail = "SAXX99 KWBC 240200\nMETAR KSEA 240153Z ...="
+        file_path.write_text(padding + tail, encoding="utf-8", newline="\n")
+
+        reader = _IemLdmReader(file_path)
+        data = reader.read_new()
+
+        # 应读到有效 bulletin 的尾部（允许 Windows 换行差异）
+        assert "METAR KSEA 240153Z ...=" in data
+        # 单次读取不超过 1MB
+        assert len(data.encode("utf-8")) <= 1024 * 1024
+        # 跳过了大部分 backlog（总 2MB+，读到的不超过 1MB）
+        assert len((padding + tail).encode("utf-8")) - len(data.encode("utf-8")) >= 1024 * 1024
+
 
 def test_parse_iem_bulletins_single_airport(relaxed_settings):
     """解析单个机场的 IEM bulletin."""
