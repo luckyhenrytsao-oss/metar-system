@@ -359,9 +359,6 @@ def _has_precision_temp(raw_text: str) -> bool:
 # IEM LDM 解析缓冲区：保存上次读取末尾未完整的 bulletin，下次读取时拼接
 _iem_ldm_parse_buffer: str = ""
 
-# IEM LDM 缓冲区大小上限（字节），防止异常情况下无限增长
-_IEM_LDM_MAX_BUFFER_SIZE = 1024 * 1024
-
 
 class _IemLdmReader:
     """IEM LDM METAR 文件读取器.
@@ -596,15 +593,6 @@ async def _fetch_iem_batch(
 
     # 拼接上次残留的未完成 bulletin
     combined = _iem_ldm_parse_buffer + new_text
-
-    # 安全上限：缓冲区过大时丢弃旧数据，防止内存无限增长
-    if len(combined.encode("utf-8")) > _IEM_LDM_MAX_BUFFER_SIZE:
-        logger.warning(
-            "IEM LDM parse buffer exceeded %d bytes, dropping old buffered content",
-            _IEM_LDM_MAX_BUFFER_SIZE,
-        )
-        _iem_ldm_parse_buffer = ""
-        combined = new_text
 
     # GTS bulletin 以 ``=`` 结尾；若 combined 未以 ``=`` 结尾，说明最后一条不完整，需缓存
     if combined.endswith("="):

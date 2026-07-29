@@ -82,6 +82,18 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
+      - name: Sync compose and nginx configs to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || '2222' }}
+          source: "docker-compose.yml,nginx/,m2-ldm/ldmd.conf,m2-ldm/pqact.conf"
+          target: "/opt/metar-system"
+          strip_components: 0
+          overwrite: true
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -97,8 +109,8 @@ jobs:
             # 拉取最新镜像
             docker compose pull
 
-            # 滚动更新
-            docker compose up -d --remove-orphans
+            # 强制重建 web 服务，确保 docker-compose.yml 的 user/挂载等改动生效
+            docker compose up -d --remove-orphans --force-recreate web
 
             # 清理旧镜像
             docker image prune -af --filter "until=168h"

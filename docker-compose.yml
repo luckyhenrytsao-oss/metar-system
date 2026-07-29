@@ -37,6 +37,10 @@ services:
       - PYTHONUNBUFFERED=1
     ports:
       - "127.0.0.1:8000:8000"
+    # 使用与宿主机 admin(1000) 相同的 GID，使 M2 能对 LDM 文件执行 truncate。
+    # Dockerfile 中 metar 用户 UID=999，这里保持 UID=999 以读取 /app 代码，
+    # 同时将 GID 设为 1000 获得 LDM 文件组写权限。
+    user: "999:1000"
     volumes:
       # 挂载 LDM 写入的 METAR 文件，供 M2 采集器读取和 truncate。
       # 注意：不可使用 :ro，否则 M2 无法执行 _maybe_truncate_iem_file()，
