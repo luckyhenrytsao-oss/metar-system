@@ -129,7 +129,11 @@ jobs:
 
               # 复制新配置
               cp ./nginx/nginx.conf /etc/nginx/nginx.conf
-              cp ./nginx/*.conf /etc/nginx/conf.d/
+              # 只复制站点配置片段，不要把主配置 nginx.conf 再次拷进 conf.d
+              for f in ./nginx/*.conf; do
+                [ "$(basename "$f")" = "nginx.conf" ] && continue
+                cp "$f" /etc/nginx/conf.d/
+              done
 
               # 测试并重载
               nginx -t && systemctl reload nginx && echo "Nginx reloaded"
