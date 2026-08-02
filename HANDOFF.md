@@ -196,6 +196,12 @@ WMKK 300300Z ...
      - `temperature_c`
    - 存储到 Redis/时序数据库，用于分析 `arrival_time - obs_time` 的全球分布。
 
+5. **对齐 AWC / weather.gov 时间解析，优先使用上游 API 绝对时间**
+   - 响应 T0TX 修复的 misdate bug：AWC 优先使用 `obsTime`，weather.gov 优先使用 `date_time`，缺失时 fallback 到 rawOb 解析。
+   - 设计方案见 `docs/proposed_time_parsing_alignment.md`。
+   - **暂不实施**：当前 M2 运行正常，且抽样对比显示 `obsTime`/`date_time` 与 rawOb 解析结果一致。
+   - **决策条件**：先让 T0TX 在新代码上运行 1~2 周，观察是否仍出现 misdate 事件，再决定是否启动修改。
+
 ---
 
 ## 8. 常用命令速查
