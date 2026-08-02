@@ -339,6 +339,12 @@ async def _fetch_weathergov_batch(
             return {}
         resp.raise_for_status()
         data = resp.json()
+        # TEMP: save raw WG response for time comparison audit
+        try:
+            with open("/tmp/wg_last_response.json", "w", encoding="utf-8") as _f:
+                json.dump(data, _f)
+        except Exception:
+            pass
         return _extract_weathergov_metars(data, requested_codes, cfg)
     except httpx.HTTPError as exc:
         logger.error("weather.gov batch fetch error: %s", exc)
