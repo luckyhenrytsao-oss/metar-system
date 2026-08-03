@@ -205,11 +205,11 @@ WMKK 300300Z ...
 6. **接入 Skyviewor fast-METAR 作为中国机场第四数据源**
    - 已实现：`app/skyviewor.py` WebSocket 采集器 + `app/config.py` 配置 + `app/main.py` 生命周期集成 + `app/database.py` 审计存储。
    - 默认**禁用**（`SKYVIEWOR_ENABLED=false`），未配置 API Key 时不启动。
-   - 采信规则（v1.0，可配置）：
+   - 采信规则（v1.1，可配置）：
      - METAR：ZBAA/ZGGG/ZSPD 的 `:00` 和 `:30` 采信；其他中国机场仅 `:00` 采信。
-     - SPECI：仅 ZBAA 采信。
+     - SPECI：ZBAA、ZGGG 采信；其他城市 SPECI 暂不采信。
    - 不可信数据写入独立 Redis key `skyviewor:audit:{icao}`，不进入标准 history，不触发 SSE。
-   - **暂不部署到 PRD**：等待用户提供 `SKYVIEWOR_API_KEY` 后，先在本地/测试环境验证，再决定是否部署。
+   - **已部署到 PRD**：`SKYVIEWOR_ENABLED=true` 且已配置 API Key，订阅 7 个中国机场，03:00 UTC 起已收到真实 METAR 并触发 winner 择优和 SSE 广播。
    - 详细设计见 `docs/skyviewor_integration_for_m2.md`（M1 文档）和本次提交的代码。
 
 ---

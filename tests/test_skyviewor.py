@@ -29,7 +29,7 @@ def skyviewor_settings(monkeypatch) -> Settings:
     monkeypatch.setenv("SKYVIEWOR_API_KEY", "sk-test-key")
     monkeypatch.setenv("SKYVIEWOR_AIRPORTS", "ZBAA,ZGGG,ZSPD,ZUCK,ZUUU,ZHHH,ZSQD")
     monkeypatch.setenv("SKYVIEWOR_TRUSTED_HALF_HOUR_AIRPORTS", "ZBAA,ZGGG,ZSPD")
-    monkeypatch.setenv("SKYVIEWOR_TRUSTED_SPECI_AIRPORTS", "ZBAA")
+    monkeypatch.setenv("SKYVIEWOR_TRUSTED_SPECI_AIRPORTS", "ZBAA,ZGGG")
     monkeypatch.setenv("METAR_MAX_AGE_SECONDS", "86400")
     monkeypatch.setenv("METAR_MAX_FUTURE_SECONDS", "600")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/9")
@@ -109,8 +109,11 @@ async def test_should_trust_rules(skyviewor_settings):
     # ZBAA SPECI -> trusted
     assert _should_trust("ZBAA", "SPECI", datetime(2026, 8, 2, 14, 12, tzinfo=timezone.utc), cfg)
 
-    # ZGGG SPECI -> not trusted
-    assert not _should_trust("ZGGG", "SPECI", datetime(2026, 8, 2, 14, 12, tzinfo=timezone.utc), cfg)
+    # ZGGG SPECI -> trusted
+    assert _should_trust("ZGGG", "SPECI", datetime(2026, 8, 2, 14, 12, tzinfo=timezone.utc), cfg)
+
+    # ZUUU SPECI -> not trusted
+    assert not _should_trust("ZUUU", "SPECI", datetime(2026, 8, 2, 14, 12, tzinfo=timezone.utc), cfg)
 
     # Unknown report type -> not trusted
     assert not _should_trust("ZBAA", "TAF", datetime(2026, 8, 2, 14, 0, tzinfo=timezone.utc), cfg)

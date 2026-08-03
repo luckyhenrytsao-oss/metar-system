@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     )
 
     skyviewor_trusted_speci_airports: str = Field(
-        default="ZBAA",
+        default="ZBAA,ZGGG",
         description="Skyviewor 中 SPECI 采信的机场",
     )
 
