@@ -309,45 +309,31 @@ async def _skyviewor_connection(
 
         while not stop_event.is_set():
             try:
-                # 使用 wait_for 以便能响应 stop_event
-                message_task = asyncio.ensure_future(websocket.recv())
-                stop_task = asyncio.ensure_future(stop_event.wait())
-                done, pending = await asyncio.wait(
-                    {message_task, stop_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-                if stop_task in done:
-                    logger.info("Skyviewor loop stop requested")
-                    return
-
-                message = message_task.result()
-                if isinstance(message, str):
-                    # ping 需要立即回复，不经过通用处理
-                    try:
-                        parsed = json.loads(message)
-                        if parsed.get("type") == "ping":
-                            await _send_pong(websocket)
-                            continue
-                    except json.JSONDecodeError:
-                        pass
-                    await _handle_message(message, redis_client, settings)
-                else:
-                    logger.warning("Skyviewor WebSocket received non-text message: %s", type(message))
+                # 短超时轮询，兼顾消息响应和 stop_event 检查，避免遗留 Task
+                message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             except websockets.ConnectionClosed as exc:
                 logger.warning("Skyviewor WebSocket closed: %s", exc)
                 return
-            except asyncio.TimeoutError:
-                continue
             except Exception as exc:
                 logger.error("Skyviewor WebSocket receive error: %s", exc)
                 return
+
+            if not isinstance(message, str):
+                logger.warning("Skyviewor WebSocket received non-text message: %s", type(message))
+                continue
+
+            # ping 需要立即回复，不经过通用处理
+            try:
+                parsed = json.loads(message)
+                if parsed.get("type") == "ping":
+                    await _send_pong(websocket)
+                    continue
+            except json.JSONDecodeError:
+                pass
+
+            await _handle_message(message, redis_client, settings)
 
 
 async def start_skyviewor_loop(settings: Optional[Settings] = None) -> None:
