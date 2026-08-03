@@ -385,6 +385,92 @@ async def get_source_history(
     return records
 
 
+def _skyviewor_audit_key(icao: str) -> str:
+    """生成 Skyviewor 未采信数据审计记录的 Redis Sorted Set Key."""
+    return f"skyviewor:audit:{icao.upper()}"
+
+
+async def add_skyviewor_audit(
+    redis_client: redis.Redis,
+    icao: str,
+    data: dict[str, Any],
+    retention_days: int = 7,
+) -> None:
+    """将一条未采信的 Skyviewor 记录写入独立审计 Sorted Set.
+
+    使用 observed_at 的 UTC 时间戳作为 score，便于按时间窗口查询。
+    整个 Sorted Set 设置 TTL，防止无限制增长。
+    """
+    icao = icao.upper()
+    observed_at = data.get("observed_at")
+    if not observed_at:
+        logger.warning("Cannot add Skyviewor audit for %s without observed_at", icao)
+        return
+
+    try:
+        obs_dt = parse_iso(observed_at)
+    except (ValueError, TypeError):
+        logger.warning("Invalid observed_at for Skyviewor audit %s: %s", icao, observed_at)
+        return
+
+    if obs_dt is None:
+        return
+
+    score = _dt_to_score(obs_dt)
+    key = _skyviewor_audit_key(icao)
+
+    record_hash = data.get("hash") or hashlib.sha1(
+        data.get("raw_text", "").encode("utf-8")
+    ).hexdigest()
+
+    audit_record = {
+        "icao": icao,
+        "source": data.get("source", "Skyviewor fast-METAR"),
+        "source_key": "skyviewor",
+        "observed_at": obs_dt.isoformat(),
+        "updated_at": data.get("updated_at") or datetime.now(timezone.utc).isoformat(),
+        "raw_text": data.get("raw_text", ""),
+        "report_type": data.get("report_type", ""),
+        "hash": record_hash,
+        "trusted": False,
+    }
+
+    member = json.dumps(audit_record, ensure_ascii=False, sort_keys=True)
+
+    pipe = redis_client.pipeline()
+    pipe.zadd(key, {member: score})
+    # 清理超过 retention 的旧记录
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    pipe.zremrangebyscore(key, "-inf", _dt_to_score(cutoff))
+    # 给整个 key 设置 TTL
+    pipe.expire(key, (retention_days + 1) * 86400)
+    await pipe.execute()
+
+
+async def get_skyviewor_audit(
+    redis_client: redis.Redis,
+    icao: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    """查询某机场 Skyviewor 审计记录在指定时间窗口内的记录.
+
+    返回按 observed_at 升序排列的记录列表。
+    """
+    key = _skyviewor_audit_key(icao)
+    min_score = _dt_to_score(start_dt) if start_dt else "-inf"
+    max_score = _dt_to_score(end_dt) if end_dt else "+inf"
+
+    members = await redis_client.zrangebyscore(key, min_score, max_score, start=0, num=limit)
+    records: list[dict[str, Any]] = []
+    for member in members:
+        parsed = _parse_history_member(member)
+        if parsed is not None:
+            records.append(parsed)
+    return records
+
+
 def parse_iso(value: Any) -> Optional[datetime]:
     """解析 ISO 8601 时间字符串为 UTC datetime.
 

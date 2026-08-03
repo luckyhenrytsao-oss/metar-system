@@ -202,6 +202,16 @@ WMKK 300300Z ...
    - **暂不实施**：当前 M2 运行正常，且抽样对比显示 `obsTime`/`date_time` 与 rawOb 解析结果一致。
    - **决策条件**：先让 T0TX 在新代码上运行 1~2 周，观察是否仍出现 misdate 事件，再决定是否启动修改。
 
+6. **接入 Skyviewor fast-METAR 作为中国机场第四数据源**
+   - 已实现：`app/skyviewor.py` WebSocket 采集器 + `app/config.py` 配置 + `app/main.py` 生命周期集成 + `app/database.py` 审计存储。
+   - 默认**禁用**（`SKYVIEWOR_ENABLED=false`），未配置 API Key 时不启动。
+   - 采信规则（v1.0，可配置）：
+     - METAR：ZBAA/ZGGG/ZSPD 的 `:00` 和 `:30` 采信；其他中国机场仅 `:00` 采信。
+     - SPECI：仅 ZBAA 采信。
+   - 不可信数据写入独立 Redis key `skyviewor:audit:{icao}`，不进入标准 history，不触发 SSE。
+   - **暂不部署到 PRD**：等待用户提供 `SKYVIEWOR_API_KEY` 后，先在本地/测试环境验证，再决定是否部署。
+   - 详细设计见 `docs/skyviewor_integration_for_m2.md`（M1 文档）和本次提交的代码。
+
 ---
 
 ## 8. 常用命令速查

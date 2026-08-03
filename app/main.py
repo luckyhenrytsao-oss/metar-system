@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.collector import close_http_client, start_collector_loop
+from app.skyviewor import close_skyviewor_loop, start_skyviewor_loop
 from app.config import Settings, get_settings
 from app.database import (
     close_redis,
@@ -32,12 +33,13 @@ logger = logging.getLogger(__name__)
 
 # 后台采集任务引用
 _collector_task: Optional[asyncio.Task] = None  # type: ignore[name-defined]
+_skyviewor_task: Optional[asyncio.Task] = None  # type: ignore[name-defined]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理：启动采集器，关闭连接."""
-    global _collector_task
+    global _collector_task, _skyviewor_task
     settings = get_settings()
     logging.getLogger().setLevel(getattr(logging, settings.log_level, logging.INFO))
 
@@ -46,6 +48,12 @@ async def lifespan(app: FastAPI):
 
     # 启动后台采集循环
     _collector_task = asyncio.create_task(start_collector_loop(settings))
+
+    # 启动 Skyviewor WebSocket 采集循环（若启用）
+    if settings.skyviewor_enabled and settings.skyviewor_api_key:
+        _skyviewor_task = asyncio.create_task(start_skyviewor_loop(settings))
+        logger.info("Skyviewor loop started")
+
     logger.info("FastAPI startup complete, collector loop started")
 
     yield
@@ -55,6 +63,14 @@ async def lifespan(app: FastAPI):
         _collector_task.cancel()
         try:
             await _collector_task
+        except asyncio.CancelledError:
+            pass
+
+    if _skyviewor_task and not _skyviewor_task.done():
+        await close_skyviewor_loop()
+        _skyviewor_task.cancel()
+        try:
+            await _skyviewor_task
         except asyncio.CancelledError:
             pass
 

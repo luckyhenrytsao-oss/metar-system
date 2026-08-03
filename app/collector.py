@@ -802,22 +802,24 @@ def _select_winner(
     weathergov_record: Optional[dict[str, Any]],
     awc_record: Optional[dict[str, Any]],
     iem_record: Optional[dict[str, Any]] = None,
+    skyviewor_record: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """从三个数据源记录中选择优胜者.
+    """从四个数据源记录中选择优胜者.
 
     选择规则:
       1. 优先比较 observed_at：时间更晚（更新）的记录胜出
       2. 若 observed_at 相同，比较入库延迟（updated_at - observed_at），延迟更小的胜出
-      3. 若仍相同，默认优先顺序：weather.gov > AWC > IEM
+      3. 若仍相同，默认优先顺序：weather.gov > AWC > IEM > Skyviewor
+         （Skyviewor 放在最后是因为其覆盖范围仅限中国机场，且信任规则较保守）
       4. 只有部分方有数据时，从有数据的记录中选择最优
     """
-    records = [weathergov_record, awc_record, iem_record]
+    records = [weathergov_record, awc_record, iem_record, skyviewor_record]
     records = [r for r in records if r is not None]
     if not records:
         return None
 
     # 源优先级：数字越小越优先，用于 exact tie-breaking
-    _SOURCE_PREF = {"weathergov": 0, "awc": 1, "iem": 2}
+    _SOURCE_PREF = {"weathergov": 0, "awc": 1, "iem": 2, "skyviewor": 3}
 
     def _key(record: dict[str, Any]) -> tuple[int, float, float, int]:
         obs = _parse_observed_at(record.get("observed_at"))
@@ -1002,27 +1004,37 @@ async def _store_winner_if_changed(
     return True
 
 
+async def _merge_and_store_winner_for(
+    redis_client: Any,
+    icao: str,
+    settings: Optional[Settings] = None,
+) -> None:
+    """为单个机场读取四个数据源记录，择优后写入最终 Key."""
+    cfg = settings or get_settings()
+    from app.database import get_source_metar
+
+    icao = icao.upper()
+    try:
+        weathergov_record = await get_source_metar(redis_client, icao, "weathergov")
+        awc_record = await get_source_metar(redis_client, icao, "awc")
+        iem_record = await get_source_metar(redis_client, icao, "iem")
+        skyviewor_record = await get_source_metar(redis_client, icao, "skyviewor")
+        winner = _select_winner(weathergov_record, awc_record, iem_record, skyviewor_record)
+        if winner is None:
+            return
+        await _store_winner_if_changed(redis_client, icao, winner, cfg)
+    except Exception as exc:
+        logger.error("Failed to merge/store winner for %s: %s", icao, exc)
+
+
 async def _merge_and_store_winners(
     redis_client: Any,
     settings: Optional[Settings] = None,
 ) -> None:
-    """为每个监控机场读取三个数据源记录，择优后写入最终 Key."""
+    """为每个监控机场读取四个数据源记录，择优后写入最终 Key."""
     cfg = settings or get_settings()
-    from app.database import get_source_metar
-
     for code in cfg.monitor_airports_list:
-        icao = code.upper()
-        try:
-            weathergov_record = await get_source_metar(redis_client, icao, "weathergov")
-            awc_record = await get_source_metar(redis_client, icao, "awc")
-            iem_record = await get_source_metar(redis_client, icao, "iem")
-            winner = _select_winner(weathergov_record, awc_record, iem_record)
-            if winner is None:
-                logger.warning("No METAR data available for %s", icao)
-                continue
-            await _store_winner_if_changed(redis_client, icao, winner, cfg)
-        except Exception as exc:
-            logger.error("Failed to merge/store winner for %s: %s", icao, exc)
+        await _merge_and_store_winner_for(redis_client, code.upper(), cfg)
 
 
 async def _poll_cycle(settings: Optional[Settings] = None) -> None:

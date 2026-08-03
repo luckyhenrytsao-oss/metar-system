@@ -112,6 +112,60 @@ class Settings(BaseSettings):
         description="可选的 SynopticData 独立 Token；未配置时抓取 weather.gov 内嵌 Token",
     )
 
+    # Skyviewor fast-METAR WebSocket 数据源
+    skyviewor_enabled: bool = Field(
+        default=False,
+        description="是否启用 Skyviewor fast-METAR WebSocket 数据源",
+    )
+
+    skyviewor_api_key: str = Field(
+        default="",
+        description="Skyviewor 长期 API Key，用于换取临时 WebSocket Token",
+    )
+
+    skyviewor_ws_url: str = Field(
+        default="wss://special.data-api.skyviewor.host/fast-metar/ws/raw",
+        description="Skyviewor fast-METAR WebSocket 地址",
+    )
+
+    skyviewor_token_url: str = Field(
+        default="https://special.data-api.skyviewor.host/fast-metar/auth/token",
+        description="Skyviewor Token 换取地址",
+    )
+
+    skyviewor_airports: str = Field(
+        default="ZBAA,ZGGG,ZSPD,ZUCK,ZUUU,ZHHH,ZSQD",
+        description="Skyviewor 订阅的中国机场 ICAO 代码列表",
+    )
+
+    skyviewor_trusted_half_hour_airports: str = Field(
+        default="ZBAA,ZGGG,ZSPD",
+        description="Skyviewor 中 :00 和 :30 都采信的机场",
+    )
+
+    skyviewor_trusted_speci_airports: str = Field(
+        default="ZBAA",
+        description="Skyviewor 中 SPECI 采信的机场",
+    )
+
+    skyviewor_audit_retention_days: int = Field(
+        default=7,
+        ge=1,
+        description="Skyviewor 未采信数据审计记录保留天数",
+    )
+
+    skyviewor_reconnect_min_seconds: float = Field(
+        default=1.0,
+        ge=0.1,
+        description="Skyviewor 断线重连最小等待秒数",
+    )
+
+    skyviewor_reconnect_max_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        description="Skyviewor 断线重连最大等待秒数",
+    )
+
     # HTTP 请求超时
     http_timeout: float = Field(
         default=15.0,
@@ -144,6 +198,36 @@ class Settings(BaseSettings):
         return [
             code.strip() for code in self.monitor_airports.split(",") if code.strip()
         ]
+
+    @computed_field
+    @property
+    def skyviewor_airports_list(self) -> List[str]:
+        """返回 Skyviewor 订阅机场列表（List[str] 形式）."""
+        return [
+            code.strip().upper()
+            for code in self.skyviewor_airports.split(",")
+            if code.strip()
+        ]
+
+    @computed_field
+    @property
+    def skyviewor_trusted_half_hour_airports_set(self) -> set[str]:
+        """返回 Skyviewor 半点采信机场集合."""
+        return {
+            code.strip().upper()
+            for code in self.skyviewor_trusted_half_hour_airports.split(",")
+            if code.strip()
+        }
+
+    @computed_field
+    @property
+    def skyviewor_trusted_speci_airports_set(self) -> set[str]:
+        """返回 Skyviewor SPECI 采信机场集合."""
+        return {
+            code.strip().upper()
+            for code in self.skyviewor_trusted_speci_airports.split(",")
+            if code.strip()
+        }
 
     @field_validator("log_level")
     @classmethod
