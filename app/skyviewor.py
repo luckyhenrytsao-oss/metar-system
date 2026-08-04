@@ -23,6 +23,7 @@ import websockets
 
 from app.config import Settings, get_settings
 from app.database import add_skyviewor_audit, get_redis
+from app.latency_logger import log_latency
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,29 @@ async def close_skyviewor_loop() -> None:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _log_skyviewor_received(
+    icao: str,
+    obs_time: Optional[datetime],
+    raw_text: str,
+    report_type: str,
+    skyviewor_received_at: str,
+    trusted: bool,
+    reject_reason: Optional[str],
+) -> None:
+    """记录 Skyviewor 消息到达事件，无论后续是否被采信."""
+    await log_latency({
+        "host": "m2",
+        "icao": icao,
+        "observed_at": obs_time.isoformat() if obs_time else None,
+        "event_type": "skyviewor_received",
+        "source_key": "skyviewor",
+        "timestamps": {"source_received_at": skyviewor_received_at},
+        "trusted": trusted,
+        "reject_reason": reject_reason,
+        "raw_text": raw_text,
+    })
 
 
 def _compute_hash(raw_text: str) -> str:
@@ -141,6 +165,7 @@ async def _store_trusted_record(
     observed_at: datetime,
     report_type: str,
     settings: Settings,
+    skyviewor_received_at: Optional[str] = None,
 ) -> None:
     """将可信 Skyviewor 记录写入标准 source key，并触发 winner 重新择优."""
     from app.collector import (
@@ -148,7 +173,7 @@ async def _store_trusted_record(
         _store_source_if_changed,
     )
 
-    metar_data = {
+    metar_data: dict[str, Any] = {
         "icao": icao,
         "raw_text": raw_text,
         "observed_at": observed_at.isoformat(),
@@ -156,6 +181,8 @@ async def _store_trusted_record(
         "source_key": "skyviewor",
         "report_type": report_type,
     }
+    if skyviewor_received_at is not None:
+        metar_data["skyviewor_received_at"] = skyviewor_received_at
 
     changed = await _store_source_if_changed(
         redis_client, icao, "skyviewor", metar_data, settings
@@ -178,27 +205,50 @@ async def _process_incoming_item(
     settings: Settings,
 ) -> None:
     """处理一条 Skyviewor 数据消息."""
+    skyviewor_received_at = _now_utc().isoformat()
+
     icao = item.get("icao", "").strip().upper()
     raw_metar = item.get("raw_metar", "")
     report_type = item.get("report_type", "").strip().upper()
     obs_time_str = item.get("obs_time", "")
 
+    reject_reason: str | None = None
+    trusted = False
+    obs_time: datetime | None = None
+    raw_text = ""
+
     if not icao or not raw_metar or not report_type:
+        reject_reason = "missing_required_fields"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         logger.debug("Skyviewor item missing required fields, skipping: %s", item)
         return
 
     # 只处理监控列表中的机场
     if icao not in settings.monitor_airports_list:
+        reject_reason = "not_monitored"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         logger.debug("Skyviewor item for non-monitored airport %s, skipping", icao)
         return
 
     # 只处理在 Skyviewor 订阅列表中的机场
     if icao not in settings.skyviewor_airports_list:
+        reject_reason = "not_subscribed"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         logger.debug("Skyviewor item for non-subscribed airport %s, skipping", icao)
         return
 
     obs_time = _parse_iso_time(obs_time_str)
     if obs_time is None:
+        reject_reason = "invalid_obs_time"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         logger.warning(
             "Skyviewor item for %s has invalid obs_time '%s', skipping",
             icao,
@@ -207,6 +257,10 @@ async def _process_incoming_item(
         return
 
     if not _is_observed_at_valid(obs_time, settings):
+        reject_reason = "invalid_observed_at"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         logger.warning(
             "Skyviewor item for %s rejected due to invalid observed_at: %s",
             icao,
@@ -218,10 +272,23 @@ async def _process_incoming_item(
     trusted = _should_trust(icao, report_type, obs_time, settings)
 
     if trusted:
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         await _store_trusted_record(
-            redis_client, icao, raw_text, obs_time, report_type, settings
+            redis_client,
+            icao,
+            raw_text,
+            obs_time,
+            report_type,
+            settings,
+            skyviewor_received_at=skyviewor_received_at,
         )
     else:
+        reject_reason = "not_trusted"
+        await _log_skyviewor_received(
+            icao, obs_time, raw_text, report_type, skyviewor_received_at, trusted, reject_reason
+        )
         audit_data = {
             "icao": icao,
             "raw_text": raw_text,

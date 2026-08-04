@@ -47,6 +47,8 @@ services:
       # 会导致 metars.txt 无限增长。
       # TODO: 后续改用 logrotate 对 LDM 文件做归档轮转，而不是由 M2 直接 truncate。
       - ./m2-ldm/data:/app/ldm_data
+      # 挂载延迟测量日志目录，便于宿主机收集和分析 m2_latency.jsonl
+      - ./data:/app/data
     networks:
       - metar-net
     healthcheck:

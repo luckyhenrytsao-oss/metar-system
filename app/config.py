@@ -166,6 +166,33 @@ class Settings(BaseSettings):
         description="Skyviewor 断线重连最大等待秒数",
     )
 
+    # 延迟测量日志 (T0TX-M2 latency measurement)
+    latency_log_enabled: bool = Field(
+        default=True,
+        validation_alias="M2_LATENCY_LOG_ENABLED",
+        description="是否启用 M2 延迟测量日志写入",
+    )
+
+    latency_log_path: str = Field(
+        default="/app/data/m2_latency.jsonl",
+        validation_alias="M2_LATENCY_LOG_PATH",
+        description="M2 延迟测量日志文件路径",
+    )
+
+    latency_log_max_bytes: int = Field(
+        default=50_000_000,
+        ge=1,
+        validation_alias="M2_LATENCY_LOG_MAX_BYTES",
+        description="延迟日志单文件大小上限（字节），超过则轮转",
+    )
+
+    latency_log_backup_count: int = Field(
+        default=3,
+        ge=0,
+        validation_alias="M2_LATENCY_LOG_BACKUP_COUNT",
+        description="延迟日志 gzip 备份保留数量",
+    )
+
     # HTTP 请求超时
     http_timeout: float = Field(
         default=15.0,

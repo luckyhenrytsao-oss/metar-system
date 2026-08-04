@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,13 @@ async def publish_event(event: dict[str, Any]) -> None:
 
     非阻塞: 如果某个订阅者队列已满, 直接丢弃该订阅者的旧事件,
     避免采集器被慢消费者拖慢.
+
+    所有事件统一附带 event_id 与 event_published_at, 用于 T0TX-M2 延迟测量.
     """
+    if "event_id" not in event:
+        event["event_id"] = str(uuid.uuid4())
+    event["event_published_at"] = datetime.now(timezone.utc).isoformat()
+
     if not _subscribers:
         return
 

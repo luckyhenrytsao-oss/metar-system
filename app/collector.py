@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +16,7 @@ import httpx
 
 from app.config import Settings, get_settings
 from app.database import get_existing_hash, get_redis, set_metar
+from app.latency_logger import log_latency
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +341,11 @@ async def _fetch_weathergov_batch(
             return {}
         resp.raise_for_status()
         data = resp.json()
-        return _extract_weathergov_metars(data, requested_codes, cfg)
+        results = _extract_weathergov_metars(data, requested_codes, cfg)
+        weathergov_received_at = _now_utc().isoformat()
+        for result in results.values():
+            result["weathergov_received_at"] = weathergov_received_at
+        return results
     except httpx.HTTPError as exc:
         logger.error("weather.gov batch fetch error: %s", exc)
     except json.JSONDecodeError as exc:
@@ -608,7 +614,11 @@ async def _fetch_iem_batch(
     # 缓存最后一个 ``=`` 之后的不完整尾部，解析前面完整的部分
     _iem_ldm_parse_buffer = combined[last_equal_pos + 1 :]
     complete_part = combined[: last_equal_pos + 1]
-    return _parse_iem_bulletins(complete_part, requested_codes, cfg)
+    results = _parse_iem_bulletins(complete_part, requested_codes, cfg)
+    iem_received_at = _now_utc().isoformat()
+    for result in results.values():
+        result["iem_received_at"] = iem_received_at
+    return results
 
 
 def _maybe_truncate_iem_file(settings: Optional[Settings] = None) -> None:
@@ -757,6 +767,9 @@ async def _fetch_awc_batch(
                 "source": "aviationweather.gov",
             }
 
+        awc_received_at = _now_utc().isoformat()
+        for result in results.values():
+            result["awc_received_at"] = awc_received_at
         return results
     except httpx.HTTPError as exc:
         logger.error("AviationWeather batch fetch error: %s", exc)
@@ -866,11 +879,16 @@ async def _store_source_if_changed(
         logger.debug("METAR unchanged for %s/%s, skipping write", icao, source)
         return False
 
+    source_stored_at = _now_utc().isoformat()
+    source_received_at = metar_data.get(f"{source}_received_at") or source_stored_at
+
     payload = {
         "icao": icao,
         "raw_text": raw_text,
         "observed_at": metar_data.get("observed_at") or _now_utc().isoformat(),
         "updated_at": _now_utc().isoformat(),
+        "source_stored_at": source_stored_at,
+        "source_received_at": source_received_at,
         "hash": new_hash,
         "source": metar_data.get("source", "unknown"),
         "source_key": source,
@@ -883,8 +901,10 @@ async def _store_source_if_changed(
     # 发布 source_update 事件到 SSE 等长连接消费者
     from app.events import publish_event
 
+    source_event_id = str(uuid.uuid4())
     await publish_event(
         {
+            "event_id": source_event_id,
             "event_type": "source_update",
             "icao": icao,
             "source_key": source,
@@ -896,6 +916,21 @@ async def _store_source_if_changed(
             "previous_hash": existing_hash,
         }
     )
+
+    await log_latency({
+        "host": "m2",
+        "event_id": source_event_id,
+        "icao": icao,
+        "observed_at": payload["observed_at"],
+        "event_type": "source_update",
+        "source_key": source,
+        "timestamps": {
+            "source_received_at": source_received_at,
+            "source_stored_at": source_stored_at,
+        },
+        "raw_text": raw_text,
+        "hash": new_hash,
+    })
 
     # 官方修正事件检测：同一 observed_at 出现了新的 hash
     correction_event = None
@@ -966,11 +1001,15 @@ async def _store_winner_if_changed(
         logger.debug("Adopted METAR unchanged for %s, skipping write", icao)
         return False
 
+    winner_published_at = _now_utc().isoformat()
     payload = {
         "icao": icao,
         "raw_text": raw_text,
         "observed_at": winner.get("observed_at") or _now_utc().isoformat(),
         "updated_at": _now_utc().isoformat(),
+        "winner_published_at": winner_published_at,
+        "source_received_at": winner.get("source_received_at"),
+        "source_stored_at": winner.get("source_stored_at"),
         "hash": new_hash,
         "source": winner.get("source", "unknown"),
         "source_key": winner.get("source_key", "unknown"),
@@ -980,8 +1019,10 @@ async def _store_winner_if_changed(
     # 发布 winner_update 事件到 SSE 等长连接消费者
     from app.events import publish_event
 
+    winner_event_id = str(uuid.uuid4())
     await publish_event(
         {
+            "event_id": winner_event_id,
             "event_type": "winner_update",
             "icao": icao,
             "source_key": payload["source_key"],
@@ -993,6 +1034,22 @@ async def _store_winner_if_changed(
             "previous_hash": existing_hash,
         }
     )
+
+    await log_latency({
+        "host": "m2",
+        "event_id": winner_event_id,
+        "icao": icao,
+        "observed_at": payload["observed_at"],
+        "event_type": "winner_update",
+        "source_key": payload["source_key"],
+        "timestamps": {
+            "source_received_at": winner.get("source_received_at"),
+            "source_stored_at": winner.get("source_stored_at"),
+            "winner_published_at": winner_published_at,
+        },
+        "raw_text": raw_text,
+        "hash": new_hash,
+    })
 
     logger.info(
         "Adopted METAR updated for %s (hash=%s... source=%s/%s)",
@@ -1022,6 +1079,23 @@ async def _merge_and_store_winner_for(
         winner = _select_winner(weathergov_record, awc_record, iem_record, skyviewor_record)
         if winner is None:
             return
+
+        # 将 winner 对应源的接收/写入时间统一标准化，便于延迟日志记录
+        source_key = winner.get("source_key", "unknown")
+        _SOURCE_RECEIVED_KEY = {
+            "weathergov": "weathergov_received_at",
+            "awc": "awc_received_at",
+            "iem": "iem_received_at",
+            "skyviewor": "skyviewor_received_at",
+        }
+        received_key = _SOURCE_RECEIVED_KEY.get(source_key)
+        if received_key and received_key in winner:
+            winner["source_received_at"] = winner[received_key]
+        elif "source_received_at" in winner:
+            pass
+        else:
+            winner["source_received_at"] = winner.get("updated_at")
+
         await _store_winner_if_changed(redis_client, icao, winner, cfg)
     except Exception as exc:
         logger.error("Failed to merge/store winner for %s: %s", icao, exc)

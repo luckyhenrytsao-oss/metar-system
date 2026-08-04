@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from app import collector as collector_module
 from app import skyviewor as skyviewor_module
 from app.config import Settings, get_settings
 from app.database import get_skyviewor_audit, get_source_metar
@@ -33,6 +34,11 @@ def skyviewor_settings(monkeypatch) -> Settings:
     monkeypatch.setenv("METAR_MAX_AGE_SECONDS", "86400")
     monkeypatch.setenv("METAR_MAX_FUTURE_SECONDS", "600")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/9")
+
+    # 固定测试时间，避免测试数据因真实日期推移而过期
+    fixed_now = datetime(2026, 8, 2, 14, 35, tzinfo=timezone.utc)
+    monkeypatch.setattr(skyviewor_module, "_now_utc", lambda: fixed_now)
+    monkeypatch.setattr(collector_module, "_now_utc", lambda: fixed_now)
 
     get_settings.cache_clear()
     return get_settings()

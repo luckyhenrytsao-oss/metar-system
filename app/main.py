@@ -394,7 +394,10 @@ async def get_metar_corrections(
 @app.get("/health")
 async def health_check():
     """健康检查接口."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # 导入 asyncio 用于 lifespan（必须在模块末尾或开头，避免循环）
