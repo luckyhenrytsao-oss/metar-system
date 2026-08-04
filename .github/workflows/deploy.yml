@@ -111,6 +111,9 @@ jobs:
             echo "Deploying ${{ env.IMAGE_NAME }}..."
             cd /opt/metar-system || (echo "Project directory not found"; exit 1)
 
+            # 登录 GHCR，否则 VPS 无法拉取私有镜像
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
             # 拉取最新镜像
             docker compose pull
 
