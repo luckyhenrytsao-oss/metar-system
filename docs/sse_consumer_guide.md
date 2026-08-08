@@ -18,12 +18,19 @@ GET /api/v1/metar/stream
 ### 1.2 请求示例
 
 ```bash
-# 订阅全部机场
-curl -N "http://localhost:8000/api/v1/metar/stream"
-
-# 只订阅指定机场，心跳 5 秒
+# 本地开发/测试
 curl -N "http://localhost:8000/api/v1/metar/stream?icaos=ZBAA,ZGGG,ZSPD&heartbeat=5"
+
+# PRD：请将 YOUR_M2_SSE_URL 替换为管理员私下提供的 VPS IP（Nginx 80 端口）
+curl -N "http://YOUR_M2_SSE_URL/api/v1/metar/stream?icaos=ZBAA,ZGGG,ZSPD&heartbeat=5"
 ```
+
+> **PRD 地址说明**：M2 部署在 VPS 上，通过 Nginx 80 端口对外暴露 SSE。由于当前使用裸 IP 且无认证，具体 IP 由管理员私下告知接入方，不在公开文档中写明。
+>
+> 建议接入方将地址配置为环境变量，例如：
+> ```bash
+> export M2_SSE_URL="http://YOUR_M2_SSE_URL"
+> ```
 
 如果请求的 `icaos` 包含 M2 未监控的机场，会返回 `404`：
 
@@ -176,7 +183,8 @@ M2 会定期发送 SSE 注释维持连接：
 ```python
 import requests
 
-url = "https://m2.example.com/api/v1/metar/stream?icaos=ZBAA,ZGGG,ZSPD,ZUCK,ZUUU,ZHHH,ZSQD&heartbeat=5"
+M2_SSE_URL = "http://YOUR_M2_SSE_URL"  # 管理员私下提供 VPS IP
+url = f"{M2_SSE_URL}/api/v1/metar/stream?icaos=ZBAA,ZGGG,ZSPD,ZUCK,ZUUU,ZHHH,ZSQD&heartbeat=5"
 response = requests.get(url, stream=True)
 for line in response.iter_lines():
     if not line:
@@ -198,8 +206,9 @@ max_backoff = 60
 
 while True:
     try:
+        M2_SSE_URL = "http://YOUR_M2_SSE_URL"  # 管理员私下提供 VPS IP
         resp = requests.get(
-            f"https://m2.example.com/api/v1/metar/stream?icaos={icaos}&heartbeat=5",
+            f"{M2_SSE_URL}/api/v1/metar/stream?icaos={icaos}&heartbeat=5",
             stream=True,
             timeout=30,
         )
